@@ -7,7 +7,8 @@ Output verified identical to rg for all 39 standard and 54 worst cases.
 These tables predate the changes made for x86-64 Linux (page-aligned `pread`, chunk size from
 the L2 cache, the writer's handling of small chunks), which are described with the Linux
 numbers in [results-x86-linux.md](results-x86-linux.md). On Apple Silicon the chunk size stays
-2 MB; the rest has not been measured on the Mac yet.
+2 MB; a comparison of the builds before and after those changes, on this Mac, is in
+[After the x86-64 Linux changes](#after-the-x86-64-linux-changes-pr-1-on-this-mac).
 
 ## Warm cache, all cores
 
@@ -253,6 +254,32 @@ The p99 of the small searches alone comes from one slow search out of 200 in thi
 runs before it gave 1.2 to 1.4 ms.
 
 Peak of the memory zg allocated (anonymous, without mapped file pages): 107 MB
+
+## After the x86-64 Linux changes (PR #1), on this Mac
+
+A/B of the build before the PR (`43008cb`) against the merged one (`c6afcef`), runs
+alternating, 15 runs per case, page cache warm, same machine and corpora as above. The
+tables above predate the PR and have not been repeated. B/A below 1 means the new build is
+faster; output identical to ripgrep's in all cases.
+
+| matrix | one thread: B/A geometric mean | all cores: B/A geometric mean |
+|---|---|---|
+| 39 standard cases | 0.990 | 1.006 |
+| 54 worst cases | 0.997 | 1.006 |
+
+The all-core cases that came out highest (up to +5 %) were repeated with 31 runs: all within
+3 %, most equal. On one thread the largest difference is -9 % on one case at the start of
+the matrix. So the changes cost nothing measurable on the Mac, apart from what the shared
+engine gains below.
+
+Shared engine (`zig build stress`, three runs of each build): a search of 540 MB takes 17.6
+to 18.5 ms in both; 2 to 16 concurrent searches take 13.5 to 17.5 ms each in both (the
+highest, at 16 callers, in the first run of each build); the memory zg allocated peaks at 70
+to 86 MB before and 85 to 106 MB after (the new build keeps the mappings and buffers of
+earlier searches). Small 8 MB searches on an idle engine:
+p50 0.72 to 0.79 ms before, 0.21 to 0.24 ms after (mappings and tuned filters are kept
+between searches). Next to a large search producing millions of lines their p99 is noisy in
+both builds (2.3 to 6.7 ms before, 1.4 to 4.5 ms after, three runs each).
 
 ## Measurement and system state
 

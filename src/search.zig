@@ -2,8 +2,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Vector width in bytes. NEON registers are 16 bytes; 32 maps to one AVX2 register elsewhere.
-pub const vec_len = if (builtin.cpu.arch.isAARCH64()) 16 else 32;
+/// Vector width in bytes: one register. NEON and x86 without AVX2 (SSE2 only) have 16-byte
+/// registers; 32 maps to one AVX2 register. On SSE2, 32-byte vectors are split in two and the
+/// lane masks put back together, which cost twice the time: one thread, `-c needle_zz` on a
+/// 540 MB cached file, 154 ms with 32 and 74 ms with 16 (68 ms with AVX2).
+pub const vec_len = if (builtin.cpu.arch.isAARCH64() or (builtin.cpu.arch == .x86_64 and !std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))) 16 else 32;
 const Vec = @Vector(vec_len, u8);
 const neon = builtin.cpu.arch.isAARCH64();
 

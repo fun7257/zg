@@ -14,9 +14,10 @@ $ zg -n ERROR app.log
 ```
 
 zg searches for an exact, case-sensitive byte string and prints the lines that contain it,
-like `grep -F` or `rg -F` on a single file. On an 8-core Apple Silicon Mac with the file in
-the page cache, it is 1.9 to 17x faster than ripgrep with all cores, and up to 3.6x faster
-on one thread (details in [Performance](#performance)).
+like `grep -F` or `rg -F` on a single file. With the file in the page cache, it is 1.9 to
+17x faster than ripgrep with all cores on an 8-core Apple Silicon Mac, 2.6 to 37x on an
+8-core x86-64 Linux laptop, and on one thread up to 3.6x and 4.3x faster (details in
+[Performance](#performance)).
 
 Scope: one file (or a buffer in memory), literal patterns. No regular expressions, no
 case folding, no directory walking.
@@ -32,7 +33,7 @@ zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
 | `-n` | prefix matching lines with their line numbers |
 | `-c` | print only the number of matching lines |
 | `-m N` | stop after N matching lines |
-| `-j N` | threads (default: one per CPU, fewer if the memory limit cannot carry them) |
+| `-j N` | threads (default: as many as pay off, up to one per CPU; see [Threads](#how-it-works)) |
 | `--io=` | how to read the file: `auto` (default, measured while searching), `mmap` or `pread` |
 | `--mem=SIZE` | cap on the memory zg allocates, e.g. `512M`, `4G` (default: what the system can hand out without swapping, at most half of the physical memory) |
 
@@ -45,13 +46,22 @@ grep does), where ripgrep prints nothing.
 Requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ```
-zig build                  # zig-out/bin/zg, ReleaseFast
+zig build                  # zig-out/bin/zg, ReleaseFast, for this machine's CPU
+zig build -Dcpu=baseline   # a portable x86-64 binary (see below)
 zig build test             # tests, in ReleaseSafe (-Dtest-optimize=Debug for Debug)
 ```
 
-Developed and measured on macOS (Apple Silicon). Linux on aarch64 and x86_64 builds, and the
-tests compile for it, but they have not been run there. The x86 code path has no tuning of
-its own yet. Windows is not supported (zg uses `mmap`).
+A build for an x86-64 CPU without AVX2 (`-Dcpu=baseline`, or any `-Dtarget` for
+distribution) also carries the core compiled for x86-64-v2 and x86-64-v3, and runs the one
+the CPU supports (checked with `cpuid`). Zig compiles every module for its own target CPU,
+so the copies are the same source in other modules. On the Ryzen below, one thread
+counting a rare pattern in a 540 MB cached file: 68 ms built for the machine, 69 ms in the
+portable binary, 155 ms in a plain baseline build before this. `-Dcpu-dispatch=false` turns it
+off; `ZG_CPU_LEVEL=v1` or `v2` runs a lower level, for testing. AVX-512 (x86-64-v4) is not
+built: the code has not been run on a CPU that has it.
+
+Developed on macOS (Apple Silicon); tested and measured there and on x86-64 Linux. Linux on
+aarch64 builds but has not been run. Windows is not supported (zg uses `mmap`).
 
 ## Library
 
@@ -113,6 +123,16 @@ pub fn main(init: std.process.Init) !void {
   and those of the writer, the file and the allocator. The library never exits the
   process or prints.
 
+One-shot engines start threads as a search goes. Zig's standard library gives each thread a
+256 KB alternate signal stack in thread-local storage (only used to print a stack trace on a
+stack overflow), and clearing it makes a thread start about 7 times slower (130 against 17 us
+on x86-64 Linux). The command line tool turns it off outside Debug builds; a program that
+embeds zg can do the same in its root file:
+
+```zig
+pub const std_options: std.Options = .{ .signal_stack_size = null };
+```
+
 The shared engine's threads wait on futexes through the `Io` given to `init`: it is meant for
 `std.Io.Threaded` (what `std.process.Init` provides), and has not been tried with an evented
 `Io`.
@@ -128,9 +148,20 @@ What the shared engine adds over running one-shot searches side by side:
   the next.
 - What earlier searches measured: below 256 MB, a search reads the file the way that was
   fastest for files of its size (mapped or `pread`, with an occasional search that tries the
-  other); above, the per-chunk choice starts from earlier measurements instead of a warm-up.
-- Truncated files: a file that shrinks while it is mapped raises SIGBUS (on Linux; on macOS
-  zg's private mapping keeps showing the old contents). A handler turns that into
+  other); above, the per-chunk choice starts from earlier measurements instead of a warm-up
+  (on Linux, above 256 MB, `pread` only: unmapping the pages a mapped search faulted in
+  holds the process's address space lock, and the other searches wait for it).
+- Kept from one search of a file to the next (files below 256 MB): its mapping, with the
+  pages already faulted in, and the filter tuned for each pattern on it. A file that changes
+  (size or modification time) is mapped and tuned again. On the Ryzen, small searches of a
+  cached 8 MB file went from 0.6 to 0.1 ms; next to a large search printing much output,
+  their p99 went from 11 to 4 ms.
+- Threads per search as they pay off, as in one-shot searches (below).
+- Freeing buffers left by large searches is done by an idle pool thread, not by whichever
+  search happens to end last.
+- Truncated files: a file that shrinks while it is mapped raises SIGBUS (on Linux, where the
+  tests truncate files under running searches; on macOS zg's private mapping keeps showing
+  the old contents). A handler turns that into
   `error.FileChanged` for the search concerned instead of a crash; other SIGBUS go to the
   handler that was there before.
 
@@ -144,7 +175,10 @@ What the shared engine adds over running one-shot searches side by side:
   filter bytes to use.
 - **Worst case**: when verifying candidates costs more than scanning, the search switches to
   Two-Way (Crochemore–Perrin), so it stays linear on adversarial input.
-- **Chunks**: the file is cut into byte ranges that threads search independently. A chunk
+- **Chunks**: the file is cut into byte ranges that threads search independently, at most a
+  thread's share of the L2 cache (read from the system: 2 MB on Apple Silicon, 256 KB on a
+  Zen 3 core shared by two threads) so that bytes read with `pread` are scanned while still in
+  the cache. A chunk
   owns the lines that start in it; a line running into later chunks is decided by the
   writer from what those chunks found. A line of any length thus costs no memory, and its
   work is spread over the threads. `-n` line numbers come from newline counts gathered by
@@ -152,15 +186,32 @@ What the shared engine adds over running one-shot searches side by side:
 - **Reading**: per chunk, through the mapping with `MADV_WILLNEED`, through the plain
   mapping, or with `pread`. Which is fastest depends on the state of the system, not only on
   whether the file is cached, so the threads time the methods on the file itself and keep
-  using the fastest, with regular re-checks. Small files go by a sampled `mincore` instead.
+  using the fastest, with regular re-checks. On Linux the mapped methods are also charged for
+  unmapping their pages at the end, a serial cost the chunk timings do not see (14 ms for
+  540 MB), so cached files are mostly read with `pread` there, from page boundaries (a copy
+  between different offsets within a cache line is several times slower on x86). Small files
+  go by a sampled `mincore` instead.
 - **Output**: each chunk renders its lines into a buffer, and the writer writes the chunks in
   order as they complete, working on chunks itself meanwhile. Lines of 16 KB and more are
   written from the mapping (or the chunk's `pread` buffer) instead of being copied.
+- **Threads** (searches without `-j`; on a shared engine, the pool threads a search lets
+  in): started as they pay off, after the
+  bandwidth-aware threading of Suleman et al. (ASPLOS 2008). Up to one per physical core
+  they start without measuring (with `-m`, from the caller alone, doubling as chunks get
+  done, since such searches often stop early; small files get fewer). The second thread of
+  each core starts only if the search has compute to overlap: when at least half of the time
+  of the chunks read with `pread` goes to scanning and rendering rather than to the copy from
+  the page cache. Otherwise the extra threads would only compete for memory bandwidth: a
+  rare pattern in a cached 540 MB file takes 24.3 ms on 8 threads and 26.4 ms on 16 on an
+  8-core Ryzen, while printing 4.7 M lines takes 41.1 and 32.6 ms. A share of 0.75 or more
+  already over the first chunks decides at once.
 - **Memory**: a cap (see `--mem`), two thirds of it as the budget for buffered output.
   Beyond it, threads stop taking new chunks until the writer catches up (the chunks right
   behind the writer always go on), and drained buffers are freed rather than kept.
 
 ## Performance
+
+### Apple Silicon (macOS)
 
 Medians of 15 runs, zg and ripgrep 15.2 (`rg -a -F --no-config`) alternating, page cache warm; 8-core Apple
 Silicon, 8 GB, macOS. Corpora from `zig build gen`: 540 MB of words (3 to 14 per line), 514 MB
@@ -192,31 +243,69 @@ Shared engine, in-process (`zig build stress`): one search of 540 MB takes 17.7 
 concurrent searches take 14.3 to 15.4 ms each (total throughput holds); small 8 MB searches
 next to a large search producing millions of lines: p50 0.65 ms, p99 2.0 ms.
 
+These numbers predate the changes made for x86-64 Linux below, which also touch code that runs
+on the Mac; it has not been measured again since.
+
+### x86-64 Linux
+
+The same matrix on an AMD Ryzen 7 7735U (8 cores, 16 threads), 20 GB, Debian 13 (Linux
+6.12), ripgrep 14.1.1; output identical to ripgrep's in every case.
+
+| | all cores: min / geometric mean | one thread: min / geometric mean |
+|---|---|---|
+| 39 standard cases | 3.16x / 5.48x | 1.00x / 1.50x |
+| 54 worst cases | 2.64x / 5.45x | 1.01x / 1.58x |
+| 10 small files (1 to 64 MB) and `-m` | 1.16x / 2.03x | |
+
+| case | zg, all cores | ripgrep | zg, one thread | ripgrep |
+|---|---|---|---|---|
+| words, `needle_zz` (1 line) | 25.2 ms | 81.8 ms | 69.4 ms | 82.2 ms |
+| words, `the` (4.7 M lines) | 30.9 ms | 378.4 ms | 203.1 ms | 383.8 ms |
+| words, `a`, `-n` (9.3 M lines) | 45.9 ms | 1019.7 ms | 281.1 ms | 983.4 ms |
+| logs, `ERROR` (1.25 M lines) | 21.8 ms | 126.9 ms | 81.3 ms | 126.2 ms |
+| `short.txt`, `a` (38 M lines) | 65.8 ms | 1702.3 ms | 394.8 ms | 1693.3 ms |
+| `long.txt`, `th` (1655 lines) | 24.2 ms | 63.9 ms | 56.2 ms | 63.4 ms |
+| words, `the`, `-m 1` | 2.1 ms | 2.4 ms | | |
+
+The portable build (`-Dcpu=baseline`) gives the same: one thread 1.03x / 1.50x on the
+standard cases (the baseline build before was 0.49x / 0.78x, slower than ripgrep). Cold
+page cache: 190 to 215 ms against 291 to 427 ms for ripgrep, near the 2.9 GB/s the SSD
+reads at. Shared engine: one search of 540 MB takes 21.6 ms; small searches of an 8 MB file
+take 0.1 ms (p50), and next to a large search printing much output 0.3 ms (p99 3.7 ms).
+All tables, and the fixes that
+took the first Linux run (all cores 2.92x, one thread 1.39x geometric mean) to these, are in
+[bench/results-x86-linux.md](bench/results-x86-linux.md).
+
 ### Reproducing
 
 ```
 zig build gen -- corpus                     # the corpora above (about 2.4 GB)
-zig build compare -- --dir corpus           # against rg: warm, one thread, memory, cold cache
+zig build compare -- --dir corpus           # against rg: warm, one thread, small files and -m, memory, cold cache
 zig build bench -- corpus/words.txt the -n  # in-process timing of one search
 zig build stress -- corpus/words.txt small.txt   # concurrent searches on a shared engine
 ```
 
 `compare --sections ab --zg A --zg-b B` alternates two zg builds instead, for A/B
-comparisons. On macOS, run a fresh binary once before timing it (its first run is scanned
+comparisons; `bench --chunk=SIZE` times a given chunk size. On macOS, run a fresh binary once before timing it (its first run is scanned
 by the system), and note that the state of the page cache can move single-thread numbers by
 a lot (see bench/results.md).
 
 ## Limitations and roadmap
 
-- `-m` with a small N is about 3 ms slower than ripgrep on all cores (every thread first
-  searches a whole 2 MB chunk); on one thread they are even.
+- `-m` with a small N was about 3 ms slower than ripgrep on all cores on the Mac (measured
+  before threads were started as they pay off; on the Linux laptop zg is now ahead, 2.0
+  against 2.6 ms).
+- Searches that turn out compute bound reach all threads only after measuring on one per
+  core: up to 4% slower than starting them all at once (`-c a` on short.txt); others are as
+  fast or faster than with all threads.
 - `searchLines` gives line numbers but not byte offsets yet.
 - Next to a large search producing much output, small searches on a shared engine wait up
-  to the time of one large chunk (about 1.4 ms) for a thread.
-- Not yet tried: the SIGBUS handling on Linux (built only), the shared engine with an evented
-  `Io`, tuning for x86.
-- Possible: caching the tuned filter per pattern on shared engines (tuning takes 0.02 to
-  0.5 ms).
+  to the time of one large chunk (about 1.4 ms on the Mac) for a thread; on the Linux laptop
+  their p99 is 3.7 ms (0.73 ms alone), from waits for the process's address space lock
+  that remain.
+- Not yet tried: the shared engine with an evented `Io`, Linux on aarch64, x86 machines other
+  than one Zen 3+ laptop.
+- Possible: AVX-512 kernels (x86-64-v4), once they can be measured.
 
 ## License
 

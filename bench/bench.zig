@@ -1,11 +1,18 @@
 //! In-process benchmark for zg's core: `zig build bench -- FILE PATTERN [options]`.
 //! Times `zg.run` only (no process start-up), several times, and reports the median.
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// As in the command line tool (src/main.zig): no alternate signal stack per thread
+/// outside Debug builds, which makes starting a thread several times cheaper.
+pub const std_options: std.Options = .{
+    .signal_stack_size = if (builtin.mode == .Debug) 1 << 18 else null,
+};
 const Io = std.Io;
 const zg = @import("zg");
 
 const usage =
-    \\usage: bench FILE PATTERN [-n] [-c] [-j=N] [--io=M] [--mem=S] [--sink=null|file|mem] [--runs=N] [--alloc=page]
+    \\usage: bench FILE PATTERN [-n] [-c] [-j=N] [--io=M] [--mem=S] [--sink=null|file|mem] [--chunk=S] [--runs=N] [--alloc=page]
     \\
 ;
 
@@ -33,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
             opts.memory_limit = zg.parseSize(a[6..]) orelse return error.BadArgument;
         } else if (std.mem.eql(u8, a, "--alloc=page")) {
             gpa = std.heap.page_allocator;
+        } else if (std.mem.startsWith(u8, a, "--chunk=")) {
+            opts.chunk_size = zg.parseSize(a[8..]) orelse return error.BadArgument;
         } else if (std.mem.startsWith(u8, a, "--runs=")) {
             runs = try std.fmt.parseInt(usize, a[7..], 10);
         } else if (std.mem.eql(u8, a, "-j")) {

@@ -9,6 +9,13 @@
 //! Then the peak memory footprint of the process (macOS: what it allocated itself, not the
 //! mapped file pages, which every concurrent search of the same file maps again).
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// As in the command line tool (src/main.zig): no alternate signal stack per thread
+/// outside Debug builds, which makes starting a thread several times cheaper.
+pub const std_options: std.Options = .{
+    .signal_stack_size = if (builtin.mode == .Debug) 1 << 18 else null,
+};
 const Io = std.Io;
 const zg = @import("zg");
 

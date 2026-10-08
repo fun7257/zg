@@ -5,6 +5,8 @@
 //!   DIR/long.txt   ~512 MB, lines of 20 KB to 600 KB
 //!   DIR/short.txt  ~300 MB, lines of 0 to 3 characters (most are empty or tiny)
 //!   DIR/random.bin ~512 MB of random bytes (NULs, newlines every ~256 bytes)
+//! Small files, the first 1, 8 and 64 MB of words.txt (cut at a line end):
+//!   DIR/w1m.txt, DIR/w8m.txt, DIR/w64m.txt
 //! A few patterns are planted so that every benchmark case has a known frequency:
 //! `needle_zz` once, `zebra` in 1000 lines, `xq` in 2000 lines (words.txt), and
 //! `unique_token_7731` once (log.txt).
@@ -39,6 +41,25 @@ pub fn main(init: std.process.Init) !void {
     try genLong(io, gpa, dir);
     try genShort(io, dir);
     try genRandom(io, dir);
+    for (small_files) |sf| try genPrefix(io, gpa, dir, "words.txt", sf.name, sf.bytes);
+}
+
+/// Smaller files for the cases where fixed costs (starting threads, setting up the
+/// search) weigh: the start of words.txt, cut at a line end.
+pub const small_files = [_]struct { name: []const u8, bytes: usize }{
+    .{ .name = "w1m.txt", .bytes = 1 << 20 },
+    .{ .name = "w8m.txt", .bytes = 8 << 20 },
+    .{ .name = "w64m.txt", .bytes = 64 << 20 },
+};
+
+fn genPrefix(io: Io, gpa: std.mem.Allocator, dir: Io.Dir, src: []const u8, name: []const u8, bytes: usize) !void {
+    const in = try dir.openFile(io, src, .{});
+    defer in.close(io);
+    const data = try gpa.alloc(u8, bytes);
+    defer gpa.free(data);
+    const n = try in.readPositionalAll(io, data, 0);
+    const end = if (std.mem.lastIndexOfScalar(u8, data[0..n], '\n')) |nl| nl + 1 else n;
+    try dir.writeFile(io, .{ .sub_path = name, .data = data[0..end] });
 }
 
 fn genLong(io: Io, gpa: std.mem.Allocator, dir: Io.Dir) !void {

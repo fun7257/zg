@@ -1,6 +1,6 @@
 # zg
 
-[中文说明](README.zh-CN.md)
+[中文说明](README.zh-CN.md) · [![CI](https://github.com/fun7257/zg/actions/workflows/ci.yml/badge.svg)](https://github.com/fun7257/zg/actions/workflows/ci.yml)
 
 A fast, line-oriented literal search for one file, written in Zig 0.16. It uses SIMD within
 chunks of the file and every core across them, and comes as a command line tool and as a
@@ -26,6 +26,7 @@ case folding, no directory walking.
 
 ```
 zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
+zg --version
 ```
 
 | option | |
@@ -36,6 +37,7 @@ zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
 | `-j N` | threads (default: as many as pay off, up to one per CPU; see [Threads](#how-it-works)) |
 | `--io=` | how to read the file: `auto` (default, measured while searching), `mmap` or `pread` |
 | `--mem=SIZE` | cap on the memory zg allocates, e.g. `512M`, `4G` (default: what the system can hand out without swapping, at most half of the physical memory) |
+| `--version`, `-V` | the version, the target, and for a portable x86-64 build the level it runs on this CPU (`running v3`) |
 
 Exit status: 0 if a line matched, 1 if none did, 2 on errors. A closed output (`| head`)
 ends the search quietly. One difference from ripgrep: `-c` with no match prints `0` (as
@@ -50,6 +52,7 @@ zig build                  # zig-out/bin/zg and the benchmark tools, ReleaseFast
 zig build install          # install only zg, into ~/.local/bin (-Dbin-dir=PATH for elsewhere)
 zig build -Dcpu=baseline   # a portable x86-64 binary (see below)
 zig build test             # tests, in ReleaseSafe (-Dtest-optimize=Debug for Debug)
+zig build test-levels      # the tests once per x86-64 level (v1, v2, v3) the machine runs
 ```
 
 A build for an x86-64 CPU without AVX2 (`-Dcpu=baseline`, or any `-Dtarget` for
@@ -61,8 +64,11 @@ portable binary, 155 ms in a plain baseline build before this. `-Dcpu-dispatch=f
 off; `ZG_CPU_LEVEL=v1` or `v2` runs a lower level, for testing. AVX-512 (x86-64-v4) is not
 built: the code has not been run on a CPU that has it.
 
-Developed on macOS (Apple Silicon); tested and measured there and on x86-64 Linux. Linux on
-aarch64 builds but has not been run. Windows is not supported (zg uses `mmap`).
+Developed on macOS (Apple Silicon); tested and measured there and on x86-64 Linux. CI
+([.github/workflows/ci.yml](.github/workflows/ci.yml)) builds and tests on Linux x86-64,
+Linux aarch64 and macOS (Apple Silicon), compares the output with `grep -F`, and on x86-64
+runs the tests and that comparison at each level of the portable build. Windows is not
+supported (zg uses `mmap`).
 
 ## Library
 

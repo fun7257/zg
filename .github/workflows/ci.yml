@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            os: ubuntu-latest
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macOS aarch64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build
+        run: zig build
+
+      - name: Unit tests (ReleaseSafe)
+        run: zig build test
+
+      - name: Unit tests (Debug)
+        run: zig build test -Dtest-optimize=Debug
+
+      - name: Output against grep -F
+        run: .github/smoke.sh zig-out/bin/zg
+
+      # The portable build carries cores for x86-64 v1, v2 and v3 and picks one at start-up:
+      # test each core, and the binary at each level the runner supports.
+      - name: Unit tests at each x86-64 level
+        if: runner.arch == 'X64'
+        run: zig build test-levels
+
+      - name: Portable build, output against grep -F at each level
+        if: runner.arch == 'X64'
+        run: |
+          zig build -Dcpu=baseline --prefix portable
+          .github/smoke.sh portable/bin/zg v1 v2 v3

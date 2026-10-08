@@ -20,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const cpu_dispatch = b.option(bool, "cpu-dispatch", "Also build the core for x86-64-v2 and -v3, chosen at run time (default: when the target CPU lacks AVX2)") orelse x86_below_v3;
     const build_options = b.addOptions();
     build_options.addOption(bool, "cpu_dispatch", cpu_dispatch);
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -128,5 +129,34 @@ pub fn build(b: *std.Build) void {
             .optimize = test_optimize,
         }),
     });
-    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // The tests once per x86-64 level that a portable build carries a core for (v1, v2,
+    // v3), as far as the build machine runs them: `test` covers only the level it is built
+    // for. On other machines this is `test`.
+    const levels_step = b.step("test-levels", "Run the unit tests compiled for each x86-64 level (v1, v2, v3) this machine supports");
+    const host = b.graph.host.result;
+    if (host.cpu.arch == .x86_64) {
+        const x86 = std.Target.x86;
+        for ([_]struct { *const std.Target.Cpu.Model, []const x86.Feature }{
+            .{ &x86.cpu.x86_64, &.{.sse2} },
+            .{ &x86.cpu.x86_64_v2, &.{ .cx16, .popcnt, .sahf, .sse4_2 } },
+            .{ &x86.cpu.x86_64_v3, &.{ .cx16, .popcnt, .sahf, .sse4_2, .avx2, .bmi, .bmi2, .f16c, .fma, .lzcnt, .movbe, .xsave } },
+        }) |level| {
+            const supported = for (level[1]) |f| {
+                if (!host.cpu.features.isEnabled(@intFromEnum(f))) break false;
+            } else true;
+            if (!supported) continue;
+            const level_tests = b.addTest(.{
+                .name = b.fmt("test-{s}", .{level[0].name}),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("src/zg.zig"),
+                    .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = host.os.tag, .abi = host.abi, .cpu_model = .{ .explicit = level[0] } }),
+                    .optimize = test_optimize,
+                }),
+            });
+            levels_step.dependOn(&b.addRunArtifact(level_tests).step);
+        }
+    } else levels_step.dependOn(test_step);
 }

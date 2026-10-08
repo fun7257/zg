@@ -768,8 +768,13 @@ const Job = struct {
         if (sc.read.capacity != 0) job.giveReadBuffer(sc.read);
         sc.read = .empty;
         sc.streak = .{};
-        if (job.inflight.fetchSub(1, .release) == 1) job.std_io.futexWake(u32, &job.inflight.raw, 1);
-        if (job.shared) |p| p.wake(); // another thread may take the freed slot
+        // Once `inflight` drops, the search's caller may see no thread on the job and free it
+        // (`Pool.remove`): nothing of the job is read after that. Waking its futex word then
+        // is harmless (at worst a spurious wake-up for whatever lives there next).
+        const io = job.std_io;
+        const pool = job.shared;
+        if (job.inflight.fetchSub(1, .release) == 1) io.futexWake(u32, &job.inflight.raw, 1);
+        if (pool) |p| p.wake(); // another thread may take the freed slot
     }
 
     /// A worker of a search whose threads `Ramp` starts.

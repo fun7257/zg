@@ -46,7 +46,8 @@ grep does), where ripgrep prints nothing.
 Requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ```
-zig build                  # zig-out/bin/zg, ReleaseFast, for this machine's CPU
+zig build                  # zig-out/bin/zg and the benchmark tools, ReleaseFast, for this machine's CPU
+zig build install          # install only zg, into ~/.local/bin (-Dbin-dir=PATH for elsewhere)
 zig build -Dcpu=baseline   # a portable x86-64 binary (see below)
 zig build test             # tests, in ReleaseSafe (-Dtest-optimize=Debug for Debug)
 ```

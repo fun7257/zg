@@ -49,7 +49,24 @@ pub fn build(b: *std.Build) void {
         }
     }
     const exe = b.addExecutable(.{ .name = "zg", .root_module = exe_mod });
-    b.installArtifact(exe);
+
+    // `zig build` (the default step) puts zg and the benchmark tools in zig-out/bin, where
+    // `compare` looks for zg. `zig build install` is for installing zg itself: only zg,
+    // into ~/.local/bin, or into `-Dbin-dir=PATH`.
+    const dev = b.step("dev", "Build zg and the benchmark tools into zig-out/bin (the default)");
+    b.default_step = dev;
+    const dev_dir: std.Build.InstallDir = .{ .custom = "bin" };
+    dev.dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = dev_dir } }).step);
+    const bin_dir = b.option([]const u8, "bin-dir", "Where `zig build install` puts zg (default: ~/.local/bin)") orelse
+        if (b.graph.environ_map.get("HOME")) |home| b.pathJoin(&.{ home, ".local", "bin" }) else null;
+    b.install_tls.description = "Install zg (only zg) into ~/.local/bin, or -Dbin-dir=PATH";
+    if (bin_dir) |dir| {
+        b.exe_dir = dir;
+        b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{}).step);
+    } else {
+        const fail = b.addFail("zig build install: HOME is not set; give the directory with -Dbin-dir=PATH");
+        b.getInstallStep().dependOn(&fail.step);
+    }
 
     const run = b.addRunArtifact(exe);
     if (b.args) |args| run.addArgs(args);
@@ -65,7 +82,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zg", .module = zg_mod }},
         }),
     });
-    b.installArtifact(bench);
+    dev.dependOn(&b.addInstallArtifact(bench, .{ .dest_dir = .{ .override = dev_dir } }).step);
     const bench_run = b.addRunArtifact(bench);
     if (b.args) |args| bench_run.addArgs(args);
     b.step("bench", "Run the in-process benchmark").dependOn(&bench_run.step);
@@ -80,7 +97,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "zg", .module = zg_mod }},
         }),
     });
-    b.installArtifact(stress);
+    dev.dependOn(&b.addInstallArtifact(stress, .{ .dest_dir = .{ .override = dev_dir } }).step);
     const stress_run = b.addRunArtifact(stress);
     if (b.args) |args| stress_run.addArgs(args);
     b.step("stress", "Run concurrent searches on one engine").dependOn(&stress_run.step);
@@ -96,7 +113,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        b.installArtifact(tool);
+        dev.dependOn(&b.addInstallArtifact(tool, .{ .dest_dir = .{ .override = dev_dir } }).step);
         const tool_run = b.addRunArtifact(tool);
         if (b.args) |args| tool_run.addArgs(args);
         b.step(name, b.fmt("Run bench/{s}.zig", .{name})).dependOn(&tool_run.step);

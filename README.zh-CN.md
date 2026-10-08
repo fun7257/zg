@@ -37,7 +37,8 @@ zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
 需要 [Zig 0.16.0](https://ziglang.org/download/)。
 
 ```
-zig build                  # 生成 zig-out/bin/zg，ReleaseFast，按本机 CPU 编译
+zig build                  # 生成 zig-out/bin/zg 和基准工具，ReleaseFast，按本机 CPU 编译
+zig build install          # 只安装 zg，到 ~/.local/bin（用 -Dbin-dir=PATH 指定别处）
 zig build -Dcpu=baseline   # 可移植的 x86-64 二进制（见下）
 zig build test             # 运行测试，ReleaseSafe（加 -Dtest-optimize=Debug 用 Debug）
 ```

@@ -1,6 +1,6 @@
 # zg
 
-[English](README.md)
+[English](README.md) · [![CI](https://github.com/fun7257/zg/actions/workflows/ci.yml/badge.svg)](https://github.com/fun7257/zg/actions/workflows/ci.yml)
 
 用 Zig 0.16 写的单文件、按行、字面量快速搜索工具：块内用 SIMD，块之间用满所有核。提供命令行工具，也可以作为库嵌入服务。
 
@@ -19,6 +19,7 @@ zg 搜索一个精确、区分大小写的字节串，输出包含它的行，�
 
 ```
 zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
+zg --version
 ```
 
 | 选项 | |
@@ -29,6 +30,7 @@ zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
 | `-j N` | 线程数（默认按实际收益决定，最多每个 CPU 一个，见[工作原理](#工作原理)；内存上限不够时也会减少） |
 | `--io=` | 读文件方式：`auto`（默认，搜索过程中实测选择）、`mmap` 或 `pread` |
 | `--mem=SIZE` | zg 自己分配内存的上限，例如 `512M`、`4G`（默认：系统当前不换页就能给出的内存，最多物理内存的一半） |
+| `--version`、`-V` | 版本、构建目标；可移植的 x86-64 构建还会显示在本机运行的级别（`running v3`） |
 
 退出码：有匹配为 0，没有匹配为 1，出错为 2。输出端提前关闭时（`| head`）安静退出。与 ripgrep 的一处差异：`-c` 没有匹配时输出 `0`（与 grep 相同），ripgrep 什么都不输出。
 
@@ -41,11 +43,12 @@ zig build                  # 生成 zig-out/bin/zg 和基准工具，ReleaseFast
 zig build install          # 只安装 zg，到 ~/.local/bin（用 -Dbin-dir=PATH 指定别处）
 zig build -Dcpu=baseline   # 可移植的 x86-64 二进制（见下）
 zig build test             # 运行测试，ReleaseSafe（加 -Dtest-optimize=Debug 用 Debug）
+zig build test-levels      # 按本机支持的每个 x86-64 级别（v1、v2、v3）各跑一遍测试
 ```
 
 为不支持 AVX2 的 x86-64 CPU 构建时（`-Dcpu=baseline`，或发布用的 `-Dtarget`），二进制里还会带上按 x86-64-v2 和 x86-64-v3 编译的核心，启动时用 `cpuid` 检测 CPU 支持哪一级，就运行哪一份。Zig 按模块指定目标 CPU，所以这几份是同一份源码放在不同模块里。在下文的 Ryzen 上，单线程在 540MB 缓存文件里计数一个稀有模式：按本机编译 68ms，可移植二进制 69ms，此前普通的基线构建要 155ms。`-Dcpu-dispatch=false` 可以关掉分派；`ZG_CPU_LEVEL=v1` 或 `v2` 可以强制使用较低的级别，用于测试。AVX-512（x86-64-v4）没有加入：这些代码还没有在支持它的 CPU 上运行过。
 
-在 macOS（Apple Silicon）上开发；在 macOS 和 x86-64 Linux 上测试并测量过性能。Linux aarch64 可以编译，但还没有实际运行过。不支持 Windows（zg 依赖 `mmap`）。
+在 macOS（Apple Silicon）上开发；在 macOS 和 x86-64 Linux 上测试并测量过性能。CI（[.github/workflows/ci.yml](.github/workflows/ci.yml)）在 Linux x86-64、Linux aarch64 和 macOS（Apple Silicon）上构建并运行测试，把输出与 `grep -F` 对比；在 x86-64 上还会对可移植构建的每个级别分别跑测试和这项对比。不支持 Windows（zg 依赖 `mmap`）。
 
 ## 作为库使用
 

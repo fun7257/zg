@@ -22,6 +22,7 @@ pub const std_options: std.Options = .{
 
 const usage =
     \\usage: zg [-n] [-c] [-m N] [-j N] [--io=M] [--mem=S] [--] PATTERN FILE
+    \\       zg --version
     \\  Case-sensitive literal, line-oriented search (SIMD + multi-threaded).
     \\  -n       prefix matching lines with line numbers
     \\  -c       print only the number of matching lines
@@ -37,6 +38,8 @@ fn Cli(comptime Zg: type) type {
     return struct {
         opts: Zg.Options,
         path: []const u8,
+        /// `--version`: print what this build is and runs, nothing else.
+        version: bool = false,
     };
 }
 
@@ -76,6 +79,8 @@ fn parseArgs(comptime Zg: type, argv: []const [:0]const u8) Cli(Zg) {
             opts.io = std.meta.stringToEnum(Zg.IoChoice, a["--io=".len..]) orelse fail("bad --io value '{s}'", .{a});
         } else if (std.mem.startsWith(u8, a, "--mem=")) {
             opts.memory_limit = Zg.parseSize(a["--mem=".len..]) orelse fail("bad --mem value '{s}' (examples: 512M, 4G)", .{a});
+        } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
+            return .{ .opts = opts, .path = "", .version = true };
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
             std.debug.print("{s}", .{usage});
             std.process.exit(0);
@@ -98,18 +103,23 @@ pub fn main(init: std.process.Init) !void {
         if (std.meta.stringToEnum(Level, text)) |asked| level = @enumFromInt(@min(@intFromEnum(asked), @intFromEnum(level)));
     }
     if (build_options.cpu_dispatch) switch (level) {
-        .v3 => return run(levels.v3, init),
-        .v2 => return run(levels.v2, init),
-        .v1 => {},
+        .v3 => return run(levels.v3, init, .v3),
+        .v2 => return run(levels.v2, init, .v2),
+        .v1 => return run(zg, init, .v1),
     };
-    return run(zg, init);
+    return run(zg, init, null);
 }
 
-/// The command line tool on the core `Zg` (`zg`, or one of its copies in `levels`).
-fn run(comptime Zg: type, init: std.process.Init) !void {
+/// The command line tool on the core `Zg` (`zg`, or one of its copies in `levels`), the
+/// one for `level` in a build with several.
+fn run(comptime Zg: type, init: std.process.Init, level: ?Level) !void {
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const cli = parseArgs(Zg, argv);
+    if (cli.version) {
+        printVersion(io, level);
+        std.process.exit(0);
+    }
 
     const file = Io.Dir.cwd().openFile(io, cli.path, .{}) catch |err| fail("{s}: {t}", .{ cli.path, err });
     defer file.close(io);
@@ -124,6 +134,21 @@ fn run(comptime Zg: type, init: std.process.Init) !void {
         else => fail("{s}: {t}", .{ cli.path, err }),
     };
     std.process.exit(if (total > 0) 0 else 1);
+}
+
+/// `zg --version`: the version, the target, and for a portable x86-64 build the level it
+/// runs on this CPU, e.g.
+///
+///     zg 0.1.0
+///     x86_64-linux, built for x86_64 with cores for x86-64 v1, v2, v3; running v3
+fn printVersion(io: Io, level: ?Level) void {
+    var buf: [256]u8 = undefined;
+    var fw = Io.File.stdout().writerStreaming(io, &buf);
+    const w = &fw.interface;
+    w.print("zg {s}\n{t}-{t}, built for {s}", .{ build_options.version, builtin.cpu.arch, builtin.os.tag, builtin.cpu.model.name }) catch return;
+    if (level) |l| w.print(" with cores for x86-64 v1, v2, v3; running {t}", .{l}) catch return;
+    w.writeAll("\n") catch return;
+    w.flush() catch {};
 }
 
 const Level = enum { v1, v2, v3 };

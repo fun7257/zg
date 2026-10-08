@@ -1,11 +1,13 @@
 //! Compares zg with ripgrep by running both as child processes:
 //!   zig build compare -- --dir DIR [--zg PATH] [--rg PATH] [--runs N]
-//!       [--sections ab,warm,single,mem,cold] [--case FILE:PATTERN]... [--filter TEXT]
+//!       [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT]
 //!       [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify]
 //! DIR must hold the corpora written by `zig build gen`. `--case` replaces the default
 //! cases; the `ab` section alternates runs of `--zg` and `--zg-b` (on `--threads` threads)
-//! instead of comparing with ripgrep.
+//! instead of comparing with ripgrep. The `small` section times its own cases (small files,
+//! `-m`), where fixed costs weigh, with the CPU time of both tools.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const Case = struct { file: []const u8, pattern: []const u8 };
@@ -60,7 +62,7 @@ const Config = struct {
     runs: usize = 15,
     /// Threads for the `ab` section (0 = default).
     threads: usize = 0,
-    sections: []const u8 = "warm,single,mem,cold",
+    sections: []const u8 = "warm,single,small,mem,cold",
     /// Only cases whose file or pattern contains this text (empty: all).
     filter: []const u8 = "",
     /// Which outputs to time: any of `lines`, `-n`, `-c`.
@@ -70,6 +72,8 @@ const Config = struct {
     /// Skip the check that zg and rg print the same (for experimental builds of zg).
     verify: bool = true,
 };
+
+const capture_allocator = std.heap.page_allocator;
 
 const Sample = struct {
     wall_ms: f64,
@@ -135,12 +139,15 @@ const Ctx = struct {
         return samples[samples.len / 2];
     }
 
-    /// Runs `args` and returns everything it wrote to stdout.
+    /// Runs `args` and returns everything it wrote to stdout, allocated with
+    /// `capture_allocator` (free it with that). Not in the arena: outputs of hundreds of MB
+    /// would stay, and a large parent makes every child slower to start and inflates its
+    /// peak RSS on Linux, which counts what the process had before `exec`.
     fn capture(c: Ctx, args: []const []const u8) ![]u8 {
         var child = try std.process.spawn(c.io, .{ .argv = args, .stdout = .pipe, .stderr = .ignore });
         var buf: [4096]u8 = undefined;
         var reader = child.stdout.?.readerStreaming(c.io, &buf);
-        const text = try reader.interface.allocRemaining(c.gpa, .unlimited);
+        const text = try reader.interface.allocRemaining(capture_allocator, .unlimited);
         _ = try child.wait(c.io);
         return text;
     }
@@ -168,8 +175,10 @@ const Ctx = struct {
         return .{ sa[runs / 2], sb[runs / 2] };
     }
 
-    /// Peak memory footprint in MB as reported by `/usr/bin/time -l` (macOS).
+    /// Peak memory in MB: the footprint reported by `/usr/bin/time -l` on macOS, the peak
+    /// RSS from `wait4` elsewhere (which includes the pages of the file mapping touched).
     fn footprint(c: Ctx, args: []const []const u8) !f64 {
+        if (!builtin.os.tag.isDarwin()) return (try c.run(args)).max_rss_mb;
         var list: std.ArrayList([]const u8) = .empty;
         defer list.deinit(c.gpa);
         try list.appendSlice(c.gpa, &.{ "/usr/bin/time", "-l" });
@@ -214,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (extra_cases.items.len != 0) cases = extra_cases.items;
     if (cfg.dir.len == 0) {
-        std.debug.print("usage: compare --dir DIR [--zg PATH] [--rg PATH] [--runs N] [--sections ab,warm,single,mem,cold] [--case FILE:PATTERN]... [--filter TEXT] [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify]\n", .{});
+        std.debug.print("usage: compare --dir DIR [--zg PATH] [--rg PATH] [--runs N] [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT] [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify]\n", .{});
         return error.BadArgument;
     }
     const c: Ctx = .{ .io = io, .gpa = gpa, .cfg = cfg };
@@ -224,6 +233,7 @@ pub fn main(init: std.process.Init) !void {
     if (has(cfg.sections, "ab")) try compareBuilds(c);
     if (has(cfg.sections, "warm")) try timing(c, "Warm cache, all cores", 0);
     if (has(cfg.sections, "single")) try timing(c, "Warm cache, one thread (-j 1 for both)", 1);
+    if (has(cfg.sections, "small")) try small(c);
     if (has(cfg.sections, "mem")) try memory(c);
     if (has(cfg.sections, "cold")) try cold(c);
 }
@@ -246,8 +256,8 @@ fn verify(c: Ctx) !void {
                 std.debug.print("OUTPUT MISMATCH: {s} {s} {s} ({d} vs {d} bytes)\n", .{ cs.file, cs.pattern, out.name(), z.len, r.len });
                 return error.OutputMismatch;
             }
-            c.gpa.free(z);
-            c.gpa.free(r);
+            capture_allocator.free(z);
+            capture_allocator.free(r);
             checked += 1;
         }
     }
@@ -295,12 +305,15 @@ fn has(list: []const u8, name: []const u8) bool {
 fn timing(c: Ctx, title: []const u8, threads: usize) !void {
     std.debug.print("\n## {s}\n\n| file | pattern | matching lines | output | zg ms | zg CPU/wall | rg ms | rg CPU/wall | zg speedup |\n|---|---|---|---|---|---|---|---|---|\n", .{title});
     var speedups: std.ArrayList(f64) = .empty;
+    var cpu_log_sum: f64 = 0; // log of zg CPU over rg CPU, per cell
     for (cases) |cs| {
         if (!c.selected(cs)) continue;
         const file = try c.path(cs.file);
         var count_args: std.ArrayList([]const u8) = .empty;
         try c.argv(&count_args, .zg, .count, 0, &.{}, cs.pattern, file);
-        const lines = std.mem.trim(u8, try c.capture(count_args.items), "\n");
+        const count_text = try c.capture(count_args.items);
+        defer capture_allocator.free(count_text);
+        const lines = std.mem.trim(u8, count_text, "\n");
         for ([_]Output{ .lines, .numbered, .count }) |out| {
             if (!has(c.cfg.outputs, out.name())) continue;
             var zl: std.ArrayList([]const u8) = .empty;
@@ -311,6 +324,7 @@ fn timing(c: Ctx, title: []const u8, threads: usize) !void {
             const z = zr[0];
             const r = zr[1];
             try speedups.append(c.gpa, r.wall_ms / z.wall_ms);
+            cpu_log_sum += @log(@max(z.cpu_ms, 0.1) / @max(r.cpu_ms, 0.1));
             std.debug.print("| {s} | `{s}` | {s} | {s} | {d:.1} | {d:.1}x | {d:.1} | {d:.1}x | {d:.2}x |\n", .{
                 cs.file,               cs.pattern,           lines,     out.name(),
                 z.wall_ms,             z.cpu_ms / z.wall_ms, r.wall_ms, r.cpu_ms / r.wall_ms,
@@ -329,10 +343,61 @@ fn timing(c: Ctx, title: []const u8, threads: usize) !void {
         @exp(log_sum / @as(f64, @floatFromInt(speedups.items.len))),
         speedups.items[speedups.items.len - 1],
     });
+    std.debug.print("CPU time, zg over rg: geometric mean {d:.2}x\n", .{@exp(cpu_log_sum / @as(f64, @floatFromInt(speedups.items.len)))});
+}
+
+/// Cases where fixed costs weigh: small files and `-m` (all cores, default settings).
+const small_cases = [_]struct { file: []const u8, pattern: []const u8, flags: []const []const u8 }{
+    .{ .file = "w1m.txt", .pattern = "the", .flags = &.{} },
+    .{ .file = "w1m.txt", .pattern = "needle_zz", .flags = &.{"-c"} },
+    .{ .file = "w8m.txt", .pattern = "the", .flags = &.{} },
+    .{ .file = "w8m.txt", .pattern = "needle_zz", .flags = &.{"-c"} },
+    .{ .file = "w64m.txt", .pattern = "the", .flags = &.{} },
+    .{ .file = "w64m.txt", .pattern = "the", .flags = &.{"-n"} },
+    .{ .file = "w64m.txt", .pattern = "needle_zz", .flags = &.{"-c"} },
+    .{ .file = "words.txt", .pattern = "the", .flags = &.{ "-m", "1" } },
+    .{ .file = "words.txt", .pattern = "zebra", .flags = &.{ "-m", "10" } },
+    .{ .file = "log.txt", .pattern = "ERROR", .flags = &.{ "-m", "1000" } },
+};
+
+fn small(c: Ctx) !void {
+    std.debug.print("\n## Small files and -m (all cores)\n\n| file | pattern | flags | zg ms | zg CPU ms | rg ms | rg CPU ms | zg speedup |\n|---|---|---|---|---|---|---|---|\n", .{});
+    var log_sum: f64 = 0;
+    var cpu_log_sum: f64 = 0;
+    for (small_cases) |cs| {
+        const file = try c.path(cs.file);
+        var zl: std.ArrayList([]const u8) = .empty;
+        var rl: std.ArrayList([]const u8) = .empty;
+        try c.argv(&zl, .zg, .lines, 0, cs.flags, cs.pattern, file);
+        try c.argv(&rl, .rg, .lines, 0, cs.flags, cs.pattern, file);
+        if (c.cfg.verify) {
+            const z = try c.capture(zl.items);
+            defer capture_allocator.free(z);
+            const r = try c.capture(rl.items);
+            defer capture_allocator.free(r);
+            const counting = cs.flags.len != 0 and std.mem.eql(u8, cs.flags[0], "-c");
+            if (!std.mem.eql(u8, z, r) and !(counting and r.len == 0 and std.mem.eql(u8, z, "0\n"))) {
+                std.debug.print("OUTPUT MISMATCH: {s} {s} ({d} vs {d} bytes)\n", .{ cs.file, cs.pattern, z.len, r.len });
+                return error.OutputMismatch;
+            }
+        }
+        const zr = try c.measurePair(zl.items, rl.items, c.cfg.runs);
+        log_sum += @log(zr[1].wall_ms / zr[0].wall_ms);
+        cpu_log_sum += @log(@max(zr[0].cpu_ms, 0.1) / @max(zr[1].cpu_ms, 0.1));
+        var flags_buf: [64]u8 = undefined;
+        var fw: Io.Writer = .fixed(&flags_buf);
+        for (cs.flags, 0..) |f, k| fw.print("{s}{s}", .{ if (k == 0) "" else " ", f }) catch {};
+        std.debug.print("| {s} | `{s}` | {s} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.2}x |\n", .{
+            cs.file, cs.pattern, fw.buffered(), zr[0].wall_ms, zr[0].cpu_ms, zr[1].wall_ms, zr[1].cpu_ms, zr[1].wall_ms / zr[0].wall_ms,
+        });
+    }
+    const n: f64 = @floatFromInt(small_cases.len);
+    std.debug.print("\nspeedup over {d} cells: geometric mean {d:.2}x; CPU time, zg over rg: geometric mean {d:.2}x\n", .{ small_cases.len, @exp(log_sum / n), @exp(cpu_log_sum / n) });
 }
 
 fn memory(c: Ctx) !void {
-    std.debug.print("\n## Peak memory footprint (MB, from /usr/bin/time -l)\n\n| file | pattern | output | zg default | zg --mem=256M | zg -j 1 | rg |\n|---|---|---|---|---|---|---|\n", .{});
+    const what = if (builtin.os.tag.isDarwin()) "Peak memory footprint (MB, from /usr/bin/time -l)" else "Peak RSS (MB, from wait4; includes the mapped file pages touched)";
+    std.debug.print("\n## {s}\n\n| file | pattern | output | zg default | zg --mem=256M | zg -j 1 | rg |\n|---|---|---|---|---|---|---|\n", .{what});
     const picks = [_]Case{ default_cases[0], default_cases[5], default_cases[6], default_cases[8], default_cases[12] };
     for (picks) |cs| {
         const file = try c.path(cs.file);
@@ -355,7 +420,8 @@ fn memory(c: Ctx) !void {
 }
 
 /// Cold page cache: every run reads a fresh copy of the file that was pushed out of the
-/// cache beforehand by reading a file larger than RAM (`purge` needs root).
+/// cache beforehand: with `POSIX_FADV_DONTNEED` on Linux, elsewhere by reading a file
+/// larger than RAM (`purge` needs root).
 fn cold(c: Ctx) !void {
     std.debug.print("\n## Cold page cache (first read from disk)\n\n", .{});
     const src_name = "words.txt";
@@ -375,12 +441,22 @@ fn cold(c: Ctx) !void {
     }
     defer for (names) |n| Io.Dir.cwd().deleteFile(c.io, n) catch {};
 
-    // Evict: stream through a file larger than RAM.
-    const evict = try c.path("evict.tmp");
-    defer Io.Dir.cwd().deleteFile(c.io, evict) catch {};
-    const ram = std.process.totalSystemMemory() catch 8 << 30;
-    try writeFiller(c, evict, ram + ram / 2);
-    try readThrough(c, evict);
+    if (builtin.os.tag == .linux) {
+        // Dirty pages are not dropped: write the copies out first.
+        for (names) |n| {
+            const file = try Io.Dir.cwd().openFile(c.io, n, .{});
+            defer file.close(c.io);
+            try file.sync(c.io);
+            _ = std.os.linux.fadvise(file.handle, 0, 0, std.os.linux.POSIX_FADV.DONTNEED);
+        }
+    } else {
+        // Evict: stream through a file larger than RAM.
+        const evict = try c.path("evict.tmp");
+        defer Io.Dir.cwd().deleteFile(c.io, evict) catch {};
+        const ram = std.process.totalSystemMemory() catch 8 << 30;
+        try writeFiller(c, evict, ram + ram / 2);
+        try readThrough(c, evict);
+    }
     for (names) |n| {
         const frac = try residentFraction(c, n);
         if (frac > 0.05) std.debug.print("(warning: {s} is {d:.0}% cached; cold numbers are optimistic)\n", .{ n, frac * 100 });

@@ -139,6 +139,9 @@ const AccessStats = struct {
     /// chunks: bytes per method, and nanoseconds of each.
     seeded: usize = 0,
     seeded_ns: [3]u64 = @splat(0),
+    /// Picoseconds per byte added to the mapped methods for the unmapping that their pages
+    /// cost later (`unmapCost`).
+    unmap_ps: u64 = 0,
 
     const Policy = struct {
         /// Chunks in a run on one method, given to one worker.
@@ -245,10 +248,170 @@ const AccessStats = struct {
         if (streak.in_row <= st.policy.settle) return;
         const k = @intFromEnum(a);
         if (st.policy.skip_first and st.seen[k].fetchAdd(1, .monotonic) == 0) return;
-        _ = st.ns[k].fetchAdd(ns, .monotonic);
+        const unmap = if (a == .read) 0 else bytes * st.unmap_ps / 1000;
+        _ = st.ns[k].fetchAdd(ns + unmap, .monotonic);
         _ = st.bytes[k].fetchAdd(bytes, .monotonic);
     }
 };
+
+/// The share of the L2 cache one hardware thread has (L2 size over the hardware threads
+/// sharing it), read from the system once. A chunk read with `pread` must still be in the
+/// cache when it is scanned, while the mapped methods hardly care, so this bounds the chunk
+/// size. Apple M1 (12 MB of L2 for 4 cores, 3 MB each): one thread, 512 MB cached file,
+/// 40.6 ms with 1 to 2 MB reads, 45.6 ms with 8 MB ones. Ryzen 7735U (512 KB for 2
+/// hardware threads, 256 KB each): 16 threads, 540 MB cached file, `-c` took 21.6 ms with
+/// 256 KB chunks, 22.3 ms with 512 KB and 62.4 ms with 2 MB; printing 4.7 M lines, 35, 72
+/// and 120 ms. Unknown: 256 KB on x86 (its cores have little L2, often shared by two
+/// threads), 2 MB elsewhere.
+fn l2PerThread(io: Io) usize {
+    const S = struct {
+        var cached: std.atomic.Value(usize) = .init(0);
+    };
+    const c = S.cached.load(.monotonic);
+    if (c != 0) return c;
+    const share = readL2PerThread(io) orelse if (builtin.cpu.arch.isX86()) 256 * 1024 else 2 * 1024 * 1024;
+    S.cached.store(share, .monotonic);
+    return share;
+}
+
+/// Physical cores (hardware threads over the threads per core), read from the system once;
+/// all CPUs when unknown. Apple Silicon has one thread per core.
+fn physicalCores(io: Io) usize {
+    const S = struct {
+        var cached: std.atomic.Value(usize) = .init(0);
+    };
+    const c = S.cached.load(.monotonic);
+    if (c != 0) return c;
+    const cpus = std.Thread.getCpuCount() catch 1;
+    const cores = readPhysicalCores(io, cpus) orelse cpus;
+    S.cached.store(@max(cores, 1), .monotonic);
+    return @max(cores, 1);
+}
+
+fn readPhysicalCores(io: Io, cpus: usize) ?usize {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => return sysctlInt("hw.physicalcpu"),
+        .linux => {
+            var buf: [256]u8 = undefined;
+            const text = sysfsText(io, "/sys/devices/system/cpu/cpu0/topology/", "thread_siblings_list", &buf) orelse return null;
+            const per_core = countCpuList(text) orelse return null;
+            return @max(1, cpus / per_core);
+        },
+        else => return null,
+    }
+}
+
+fn readL2PerThread(io: Io) ?usize {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => {
+            // The performance cores' L2 (perflevel0), else the one L2 of older systems.
+            const size = sysctlInt("hw.perflevel0.l2cachesize") orelse sysctlInt("hw.l2cachesize") orelse return null;
+            const sharing = sysctlInt("hw.perflevel0.cpusperl2") orelse 1;
+            return size / @max(sharing, 1);
+        },
+        .linux => {
+            var k: usize = 0;
+            while (k < 8) : (k += 1) {
+                var path_buf: [64]u8 = undefined;
+                var buf: [256]u8 = undefined;
+                const dir = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu0/cache/index{d}/", .{k}) catch return null;
+                const level = sysfsText(io, dir, "level", &buf) orelse return null;
+                if (!std.mem.eql(u8, level, "2")) continue;
+                if (std.mem.eql(u8, sysfsText(io, dir, "type", &buf) orelse return null, "Instruction")) continue;
+                const size = parseCacheSize(sysfsText(io, dir, "size", &buf) orelse return null) orelse return null;
+                const sharing = countCpuList(sysfsText(io, dir, "shared_cpu_list", &buf) orelse return null) orelse return null;
+                return size / @max(sharing, 1);
+            }
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn sysctlInt(name: [*:0]const u8) ?usize {
+    var v: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (std.c.sysctlbyname(name, &v, &len, null, 0) != 0 or len == 0) return null;
+    // A 32-bit value fills the low bytes (little-endian).
+    return if (v == 0) null else @intCast(v);
+}
+
+/// The trimmed contents of `dir ++ name`, in `buf`.
+fn sysfsText(io: Io, dir: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
+    var path_buf: [96]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ dir, name }) catch return null;
+    const text = Io.Dir.cwd().readFile(io, path, buf) catch return null;
+    return std.mem.trim(u8, text, " \n");
+}
+
+/// "512K", "1024K", "2M" (sysfs cache sizes).
+fn parseCacheSize(text: []const u8) ?usize {
+    if (text.len == 0) return null;
+    const unit: usize = switch (text[text.len - 1]) {
+        'K' => 1024,
+        'M' => 1024 * 1024,
+        '0'...'9' => 1,
+        else => return null,
+    };
+    const digits = if (unit == 1) text else text[0 .. text.len - 1];
+    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
+    return if (n == 0) null else n * unit;
+}
+
+/// Number of CPUs in a list like "0-1,8-9" or "3".
+fn countCpuList(text: []const u8) ?usize {
+    var n: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, text, ',');
+    while (it.next()) |range| {
+        if (std.mem.indexOfScalar(u8, range, '-')) |dash| {
+            const a = std.fmt.parseInt(usize, range[0..dash], 10) catch return null;
+            const b = std.fmt.parseInt(usize, range[dash + 1 ..], 10) catch return null;
+            if (b < a) return null;
+            n += b - a + 1;
+        } else {
+            _ = std.fmt.parseInt(usize, range, 10) catch return null;
+            n += 1;
+        }
+    }
+    return if (n == 0) null else n;
+}
+
+test "cache sizes and CPU lists from sysfs" {
+    try testing.expectEqual(@as(?usize, 512 * 1024), parseCacheSize("512K"));
+    try testing.expectEqual(@as(?usize, 2 * 1024 * 1024), parseCacheSize("2M"));
+    try testing.expectEqual(@as(?usize, null), parseCacheSize("K"));
+    try testing.expectEqual(@as(?usize, null), parseCacheSize(""));
+    try testing.expectEqual(@as(?usize, 2), countCpuList("0-1"));
+    try testing.expectEqual(@as(?usize, 4), countCpuList("0-1,8-9"));
+    try testing.expectEqual(@as(?usize, 1), countCpuList("3"));
+    try testing.expectEqual(@as(?usize, null), countCpuList("2-1"));
+    const share = l2PerThread(testing.io);
+    try testing.expect(share >= 16 * 1024 and share <= 64 * 1024 * 1024);
+    const cores = physicalCores(testing.io);
+    try testing.expect(cores >= 1 and cores <= try std.Thread.getCpuCount());
+}
+
+/// What unmapping the pages that the mapped methods touched costs, in picoseconds per
+/// chunk byte. On Linux every page a mapped chunk faulted in has to be unmapped again at the
+/// end, by one thread while the others are done: on a Ryzen 7735U, 13.8 ms for 540 MB
+/// (about 100 ns per 4 KB page), against 17 ms for the whole search on 8 threads before
+/// it. The chunk timings do not see it; spread over the chunks, it is a cost per byte for
+/// each of the threads it holds back. (Not seen on macOS.)
+fn unmapCost(nthreads: usize) u64 {
+    if (builtin.os.tag != .linux) return 0;
+    return 100 * 1000 / std.heap.pageSize() * nthreads;
+}
+
+/// Unmaps `m` a slice at a time. Unmapping holds the process's address space lock for
+/// writing, and for pages that were faulted in it takes long (14 ms for 540 MB on a Ryzen
+/// 7735U), during which every other search in the process (a server's) waits to map,
+/// unmap or fault in a page. Between slices they get the lock.
+fn unmapInSlices(m: []align(std.heap.page_size_min) u8) void {
+    const slice = 8 << 20;
+    var at: usize = 0;
+    while (m.len - at > slice) : (at += slice) std.posix.munmap(@alignCast(m[at..][0..slice]));
+    std.posix.munmap(@alignCast(m[at..]));
+}
 
 /// Files with at least this fraction (in percent) of pages in the page cache use mmap.
 const mmap_resident_percent = 90;
@@ -309,6 +472,8 @@ const ChunkResult = struct {
     /// The `pread` buffer that `refs`, `tail` and `cont` point into, handed over by the
     /// worker (empty if the chunk was mapped or none of them is used).
     buf: std.ArrayList(u8) = .empty,
+    /// Or copies of `tail` and `cont`, when they are short (`Job.handOver`).
+    pieces: std.ArrayList(u8) = .empty,
     /// `pread` chunks: the part of the pending line inside the chunk ([pending.start, hi))...
     tail: []const u8 = &.{},
     /// ...and the chunk's part of a line that began earlier ([lo, end of that line or hi)),
@@ -340,6 +505,31 @@ const Memory = struct {
 /// Buffers kept for reuse, in the accounting of `Memory.pool_bytes`. One search has its
 /// own; a shared engine keeps them from one search to the next, so that a search starts
 /// with buffers whose pages are already in.
+/// A lock for short critical sections that several threads enter at every chunk (the
+/// buffer pools, a shared engine's list of searches). It spins a little, then sleeps on a
+/// futex, where a pure spin lock (as before) lets the threads waiting for a holder that was
+/// descheduled spin for the rest of their time slice; a shared engine runs more threads
+/// than cores (its pool, and every search's caller). It did not change the latency of small
+/// searches next to a large one in `zig build stress`.
+const Lock = struct {
+    m: Io.Mutex = .init,
+
+    /// Tries before sleeping: about a microsecond and a half of pauses on current x86.
+    const spins = 64;
+
+    fn acquire(l: *Lock, io: Io) void {
+        for (0..spins) |_| {
+            if (l.m.tryLock()) return;
+            std.atomic.spinLoopHint();
+        }
+        l.m.lockUncancelable(io);
+    }
+
+    fn release(l: *Lock, io: Io) void {
+        l.m.unlock(io);
+    }
+};
+
 const Buffers = struct {
     /// Output buffers the writer has drained: allocating a fresh buffer for every chunk
     /// would page-fault in (and hoard) memory for the whole output.
@@ -348,35 +538,40 @@ const Buffers = struct {
     /// output buffers, whose pages may never have been touched): a buffer taken from here
     /// is ready, so its first use measures the method and not page faults.
     read: std.ArrayList(std.ArrayList(u8)) = .empty,
-    lock: std.atomic.Value(bool) = .init(false),
+    lock: Lock = .{},
 
-    fn acquire(b: *Buffers) void {
-        while (b.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    fn acquire(b: *Buffers, io: Io) void {
+        b.lock.acquire(io);
     }
 
-    fn release(b: *Buffers) void {
-        b.lock.store(false, .release);
+    fn release(b: *Buffers, io: Io) void {
+        b.lock.release(io);
     }
 
-    /// Frees buffers until at most `keep` bytes are left.
-    fn trim(b: *Buffers, gpa: std.mem.Allocator, mem: *Memory, keep: usize) void {
-        b.acquire();
-        defer b.release();
-        var held: usize = 0;
-        for ([_]*std.ArrayList(std.ArrayList(u8)){ &b.read, &b.out }) |list| {
-            var k: usize = 0;
-            while (k < list.items.len) {
-                const cap = list.items[k].capacity;
-                if (cap != 0 and held + cap <= keep) {
-                    held += cap;
-                    k += 1;
-                    continue;
+    /// Frees buffers until at most `keep` bytes are left. Each buffer is freed outside the
+    /// lock: freeing unmaps memory, and the workers take and give back buffers under the
+    /// lock at every chunk.
+    fn trim(b: *Buffers, io: Io, gpa: std.mem.Allocator, mem: *Memory, keep: usize) void {
+        while (true) {
+            var victim: std.ArrayList(u8) = blk: {
+                b.acquire(io);
+                defer b.release(io);
+                var held: usize = 0;
+                for ([_]*std.ArrayList(std.ArrayList(u8)){ &b.read, &b.out }) |list| {
+                    for (list.items, 0..) |buf, k| {
+                        if (buf.capacity != 0 and held + buf.capacity <= keep) {
+                            held += buf.capacity;
+                            continue;
+                        }
+                        _ = mem.pool_bytes.fetchSub(buf.capacity, .monotonic);
+                        break :blk list.swapRemove(k);
+                    }
                 }
-                var buf = list.swapRemove(k);
-                _ = mem.pool_bytes.fetchSub(cap, .monotonic);
-                buf.deinit(gpa);
-            }
-            if (list.items.len == 0) list.clearAndFree(gpa);
+                if (b.read.items.len == 0) b.read.clearAndFree(gpa);
+                if (b.out.items.len == 0) b.out.clearAndFree(gpa);
+                return;
+            };
+            victim.deinit(gpa);
         }
     }
 };
@@ -419,6 +614,11 @@ const Job = struct {
     /// became ready (the writer waits on it).
     progress: std.atomic.Value(u32) = .init(0),
     completed: std.atomic.Value(u32) = .init(0),
+    /// Threads asleep (or about to be) on `progress`, `completed` and `published`
+    /// (`sleepOn`, `wakeOn`).
+    progress_sleepers: std.atomic.Value(u32) = .init(0),
+    completed_sleepers: std.atomic.Value(u32) = .init(0),
+    published_sleepers: std.atomic.Value(u32) = .init(0),
     /// First error raised by any worker (`@intFromError`), or 0.
     err: std.atomic.Value(u16) = .init(0),
     /// Shared engines only: the pool whose threads work on this job, the number of them on
@@ -426,7 +626,7 @@ const Job = struct {
     /// the job), and how many may be on it at once.
     shared: ?*Pool = null,
     inflight: std.atomic.Value(u32) = .init(0),
-    max_workers: u32 = 0,
+    max_workers: std.atomic.Value(u32) = .init(0),
     /// A cancel handle or a deadline is set (`checkStop` has something to check).
     watched: bool = false,
     cancel: ?*Cancel = null,
@@ -439,10 +639,17 @@ const Job = struct {
     found: std.atomic.Value(usize) = .init(0),
     /// No more chunks are handed out: the search has its result (`max_matches`) or failed.
     halted: std.atomic.Value(bool) = .init(false),
+    /// One-shot searches: the threads are started as they pay off (`Ramp`).
+    ramp: ?*Ramp = null,
+    /// Chunks done (for `Ramp`).
+    done_chunks: std.atomic.Value(u32) = .init(0),
+    /// Time `pread` chunks spent reading, and working on what they read (for `Ramp`).
+    read_ns: std.atomic.Value(u64) = .init(0),
+    work_ns: std.atomic.Value(u64) = .init(0),
 
     fn takeBuffer(job: *Job) std.ArrayList(u8) {
-        job.bufs.acquire();
-        defer job.bufs.release();
+        job.bufs.acquire(job.std_io);
+        defer job.bufs.release(job.std_io);
         const buf = job.bufs.out.pop() orelse return .empty;
         _ = job.mem.pool_bytes.fetchSub(buf.capacity, .monotonic);
         return buf;
@@ -451,8 +658,8 @@ const Job = struct {
     /// A `pread` buffer of at least `n` bytes with all its pages touched.
     fn takeReadBuffer(job: *Job, n: usize) !std.ArrayList(u8) {
         var buf: std.ArrayList(u8) = blk: {
-            job.bufs.acquire();
-            defer job.bufs.release();
+            job.bufs.acquire(job.std_io);
+            defer job.bufs.release(job.std_io);
             const b = job.bufs.read.pop() orelse break :blk .empty;
             _ = job.mem.pool_bytes.fetchSub(b.capacity, .monotonic);
             break :blk b;
@@ -469,8 +676,8 @@ const Job = struct {
         var b = buf;
         b.clearRetainingCapacity();
         if (job.mem.accounted() + b.capacity > job.mem.budget) return b.deinit(job.gpa);
-        job.bufs.acquire();
-        defer job.bufs.release();
+        job.bufs.acquire(job.std_io);
+        defer job.bufs.release(job.std_io);
         job.bufs.read.append(job.gpa, b) catch return b.deinit(job.gpa);
         _ = job.mem.pool_bytes.fetchAdd(b.capacity, .monotonic);
     }
@@ -480,8 +687,8 @@ const Job = struct {
         var b = buf;
         b.clearRetainingCapacity();
         if (job.mem.accounted() + b.capacity > job.mem.budget) return b.deinit(job.gpa);
-        job.bufs.acquire();
-        defer job.bufs.release();
+        job.bufs.acquire(job.std_io);
+        defer job.bufs.release(job.std_io);
         job.bufs.out.append(job.gpa, b) catch return b.deinit(job.gpa);
         _ = job.mem.pool_bytes.fetchAdd(b.capacity, .monotonic);
     }
@@ -523,9 +730,26 @@ const Job = struct {
 
     /// The writer freed memory or moved on: workers held back by the budget re-check.
     fn madeProgress(job: *Job) void {
-        _ = job.progress.fetchAdd(1, .release);
-        job.std_io.futexWake(u32, &job.progress.raw, @intCast(job.nthreads));
+        _ = job.progress.fetchAdd(1, .seq_cst);
+        job.wakeOn(&job.progress, &job.progress_sleepers, @intCast(job.nthreads));
         if (job.shared) |p| p.wake();
+    }
+
+    /// Sleeps while `word` holds `seen`. The sleeper is counted in `sleepers` first, so
+    /// that `wakeOn` can skip the system call when nobody sleeps: the writer and the chunks
+    /// signal once or twice per chunk, mostly to no one (16 threads, 2000 chunks: 14 000
+    /// futex calls in a search with one matching line, a few dozen with this).
+    /// Both sides are sequentially consistent: either the sleeper sees the new value of
+    /// `word`, or the waker sees the sleeper.
+    fn sleepOn(job: *Job, word: *std.atomic.Value(u32), sleepers: *std.atomic.Value(u32), seen: u32) void {
+        _ = sleepers.fetchAdd(1, .seq_cst);
+        if (word.load(.seq_cst) == seen) job.std_io.futexWaitUncancelable(u32, &word.raw, seen);
+        _ = sleepers.fetchSub(1, .monotonic);
+    }
+
+    /// Wakes up to `n` sleepers of `word`, after a sequentially consistent change of it.
+    fn wakeOn(job: *Job, word: *std.atomic.Value(u32), sleepers: *std.atomic.Value(u32), n: u32) void {
+        if (sleepers.load(.seq_cst) != 0) job.std_io.futexWake(u32, &word.raw, n);
     }
 
     /// Whether a chunk could be claimed now without waiting (pool threads skip the job
@@ -548,7 +772,8 @@ const Job = struct {
         if (job.shared) |p| p.wake(); // another thread may take the freed slot
     }
 
-    fn worker(job: *Job) void {
+    /// A worker of a search whose threads `Ramp` starts.
+    fn rampWorker(job: *Job) void {
         var sc: Scratch = .{};
         defer sc.deinit(job.gpa);
         while (job.workOne(&sc, true)) {}
@@ -569,11 +794,14 @@ const Job = struct {
                 const head = @max(job.written.load(.acquire), job.need.load(.acquire));
                 if (nx >= job.nchunks or nx <= head + job.nthreads) break;
                 if (!block) return false;
-                job.std_io.futexWaitUncancelable(u32, &job.progress.raw, seen);
+                job.sleepOn(&job.progress, &job.progress_sleepers, seen);
             }
         }
         const i = job.next.fetchAdd(1, .monotonic);
         if (i >= job.nchunks) return false;
+        defer if (job.ramp != null) {
+            _ = job.done_chunks.fetchAdd(1, .release);
+        };
         job.doChunk(i, sc) catch |err| {
             _ = job.err.cmpxchgStrong(0, @intFromError(err), .monotonic, .monotonic);
             // Chunks waiting for this one's line count must see the error instead.
@@ -582,8 +810,8 @@ const Job = struct {
         // Also on error, or the writer would wait for this chunk forever.
         if (job.stream) {
             job.ready[i].store(true, .release);
-            _ = job.completed.fetchAdd(1, .release);
-            job.std_io.futexWake(u32, &job.completed.raw, 1);
+            _ = job.completed.fetchAdd(1, .seq_cst);
+            job.wakeOn(&job.completed, &job.completed_sleepers, 1);
         }
         return true;
     }
@@ -607,13 +835,13 @@ const Job = struct {
             if (seen == i) break;
             if (job.err.load(.monotonic) != 0) return error.Aborted;
             if (wait_start == null) wait_start = Io.Timestamp.now(job.std_io, .awake);
-            job.std_io.futexWaitUncancelable(u32, &job.published.raw, seen);
+            job.sleepOn(&job.published, &job.published_sleepers, seen);
         }
         if (wait_start) |t| sc.waited += @intCast(@max(0, t.durationTo(Io.Timestamp.now(job.std_io, .awake)).nanoseconds));
         const first: usize = if (i == 0) 0 else job.line_end[i - 1].load(.monotonic);
         job.line_end[i].store(first + newlines, .monotonic);
-        job.published.store(@intCast(i + 1), .release);
-        job.std_io.futexWake(u32, &job.published.raw, @intCast(job.nthreads));
+        job.published.store(@intCast(i + 1), .seq_cst);
+        job.wakeOn(&job.published, &job.published_sleepers, @intCast(job.nthreads));
         return first;
     }
 
@@ -629,16 +857,26 @@ const Job = struct {
         const v_lo = if (i == 0) 0 else lo - 1;
         const v_hi = @min(hi + m - 1, size);
         const access = job.access.pick(&sc.streak);
-        if (access == .read and sc.read.capacity < v_hi - v_lo) {
+        // `pread` starts at a page boundary: the kernel copies from the page cache into the
+        // buffer, and with source and destination at different offsets within a cache line
+        // the copy is several times slower on x86 (2 MB from offset 2097151: 0.6 to 1.2 ms,
+        // against 0.2 ms from offset 0).
+        const r_lo = v_lo / std.heap.pageSize() * std.heap.pageSize();
+        if (access == .read and sc.read.capacity < v_hi - r_lo) {
             // Readied before the clock starts: buffer set-up is not part of the method.
             if (sc.read.capacity != 0) job.giveReadBuffer(sc.read);
-            sc.read = try job.takeReadBuffer(v_hi - v_lo);
+            sc.read = try job.takeReadBuffer(v_hi - r_lo);
         }
         sc.waited = 0;
         const t0 = Io.Timestamp.now(job.std_io, .awake);
+        var read_ns: u64 = 0;
         defer {
             const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Timestamp.now(job.std_io, .awake)).nanoseconds));
             job.access.record(&sc.streak, access, ns -| sc.waited, hi - lo);
+            if (access == .read and job.ramp != null) {
+                _ = job.read_ns.fetchAdd(read_ns, .monotonic);
+                _ = job.work_ns.fetchAdd(ns -| sc.waited -| read_ns, .monotonic);
+            }
         }
         const view: []const u8 = switch (access) {
             .map_advise => blk: {
@@ -647,10 +885,10 @@ const Job = struct {
             },
             .map => job.data[v_lo..v_hi],
             .read => blk: {
-                sc.read.items.len = v_hi - v_lo; // capacity readied above
-
-                try readAt(job.std_io, job.file.?, sc.read.items, v_lo);
-                break :blk sc.read.items;
+                sc.read.items.len = v_hi - r_lo; // capacity readied above
+                try readAt(job.std_io, job.file.?, sc.read.items, r_lo);
+                read_ns = @intCast(@max(0, t0.durationTo(Io.Timestamp.now(job.std_io, .awake)).nanoseconds));
+                break :blk sc.read.items[v_lo - r_lo ..];
             },
         };
         // The first line starting in [lo, hi) follows a newline in [lo - 1, hi - 1).
@@ -731,12 +969,29 @@ const Job = struct {
             if (job.ready[j].load(.acquire)) return;
             // Stopped: chunks no longer handed out would never be ready.
             if (job.err.load(.acquire) != 0) return checkErr(job);
-            if (!job.workOne(sc, false)) job.std_io.futexWaitUncancelable(u32, &job.completed.raw, seen);
+            if (!job.workOne(sc, false)) job.sleepOn(&job.completed, &job.completed_sleepers, seen);
         }
     }
 
-    /// Gives the worker's `pread` buffer to the chunk's result (the worker takes another).
-    fn handOver(job: *Job, res: *ChunkResult, sc: *Scratch, tail: []const u8, cont: []const u8) void {
+    /// Keeps what the writer needs of a `pread` chunk: the worker's buffer goes to the chunk's
+    /// result (the worker takes another), unless all that is needed is a few short pieces of
+    /// lines (no `refs`), which are copied instead. Nearly every chunk ends inside a line, so
+    /// handing over the buffer would make the workers allocate (and fault in) a new one per
+    /// chunk while the writer catches up: on 16 threads with 256 KB chunks, 1300 buffers for
+    /// 2000 chunks, and plain output of one matching line 33.5 ms against 26.8 ms with the
+    /// pieces copied.
+    fn handOver(job: *Job, res: *ChunkResult, sc: *Scratch, has_refs: bool, tail: []const u8, cont: []const u8) void {
+        if (!has_refs and tail.len + cont.len <= zero_copy_min_len) copy: {
+            var pieces: std.ArrayList(u8) = .empty;
+            pieces.ensureTotalCapacityPrecise(job.gpa, tail.len + cont.len) catch break :copy;
+            pieces.appendSliceAssumeCapacity(tail);
+            pieces.appendSliceAssumeCapacity(cont);
+            res.pieces = pieces;
+            res.tail = pieces.items[0..tail.len];
+            res.cont = pieces.items[tail.len..];
+            _ = job.mem.queued.fetchAdd(pieces.items.len, .monotonic);
+            return;
+        }
         res.buf = sc.read;
         res.tail = tail;
         res.cont = cont;
@@ -816,9 +1071,22 @@ const Job = struct {
         return p >= lo and p + hay.len <= lo + job.data.len;
     }
 
+    /// At the first matching line of a chunk: an output buffer for all of it. Reserved in
+    /// one go: growing by reallocation leaves freed blocks behind in the allocator, which
+    /// would show up as memory well beyond the budget. Reserved but untouched pages cost
+    /// nothing. Not before a match: chunks without one would each hold a buffer until the
+    /// writer gets to them, and with many small chunks the pool runs dry and the workers
+    /// keep mapping new ones (16 threads, 2000 chunks: 460 buffers for one matching line).
+    noinline fn reserveOut(job: *Job, out: *std.ArrayList(u8), n: usize) !void {
+        @branchHint(.cold);
+        out.* = job.takeBuffer();
+        try out.ensureTotalCapacity(job.gpa, n);
+    }
+
     /// Appends the line `hay[ls..le]` and its newline to `out`; a very long line is recorded
     /// in `refs` instead of being copied (a `pread` chunk then hands its buffer over).
-    inline fn appendLineText(job: *const Job, out: *std.ArrayList(u8), refs: *std.ArrayList(Ref), hay: []const u8, ls: usize, le: usize) !void {
+    inline fn appendLineText(job: *Job, out: *std.ArrayList(u8), refs: *std.ArrayList(Ref), hay: []const u8, ls: usize, le: usize) !void {
+        if (out.capacity == 0) try job.reserveOut(out, hay.len + 1);
         const n = le - ls;
         if (n >= zero_copy_min_len) {
             const start = hay.ptr + ls;
@@ -866,20 +1134,13 @@ const Job = struct {
             const newlines: usize = @intFromBool(hi > lo and view[hi - 1 - v_lo] == '\n');
             if (mode == .numbered) _ = try job.firstLine(chunk, newlines, sc);
             res.* = .{ .cont_found = cont_found };
-            if (mode != .count and !job.isMapped(view) and cont.len != 0) job.handOver(res, sc, &.{}, cont);
+            if (mode != .count and !job.isMapped(view) and cont.len != 0) job.handOver(res, sc, false, &.{}, cont);
             return;
         };
         own_base_offset = @intFromBool(f > lo);
         const hay = view[f - v_lo ..]; // file bytes [f, v_lo + view.len)
         const own_end = hi - f; // match starts below this are ours
         std.debug.assert(hay.len <= std.math.maxInt(u32));
-        if (mode == .text) {
-            out = job.takeBuffer();
-            // Reserve in one go: growing by reallocation leaves freed blocks behind in the
-            // allocator, which would show up as memory well beyond the budget. Reserved but
-            // untouched pages cost nothing.
-            try out.ensureTotalCapacity(job.gpa, hay.len + 1);
-        }
         if (mode == .numbered) {
             // At most one match per m + 1 bytes.
             sc.matches.clearRetainingCapacity();
@@ -941,7 +1202,7 @@ const Job = struct {
         // together, keep the buffer alive until the writer is done with it.
         if (mode != .count and !job.isMapped(view)) {
             const tail: []const u8 = if (pending) |pd| view[pd.start - v_lo .. hi - v_lo] else &.{};
-            if (refs.items.len != 0 or tail.len != 0 or cont.len != 0) job.handOver(res, sc, tail, cont);
+            if (refs.items.len != 0 or tail.len != 0 or cont.len != 0) job.handOver(res, sc, refs.items.len != 0, tail, cont);
         }
     }
 };
@@ -1359,7 +1620,7 @@ const Pool = struct {
     /// Searches with work for the pool, under `lock`; `turn` rotates through them, so that
     /// every search gets threads and a small one is not stuck behind a large one.
     jobs: std.ArrayList(*Job) = .empty,
-    lock: std.atomic.Value(bool) = .init(false),
+    lock: Lock = .{},
     turn: usize = 0,
     /// Number of `jobs`, readable without the lock.
     njobs: std.atomic.Value(usize) = .init(0),
@@ -1378,6 +1639,8 @@ const Pool = struct {
     /// What earlier searches measured of the access methods, per file size class
     /// (`sizeClass`), under `lock`, so that a search does not have to find out again.
     priors: [size_classes]Priors = @splat(.{}),
+    maps: MapCache = .{},
+    tunes: TuneCache = .{},
 
     /// Files up to 4 MB, 32 MB, 256 MB, larger.
     const size_classes = 4;
@@ -1516,7 +1779,9 @@ const Pool = struct {
     fn destroy(p: *Pool) void {
         std.debug.assert(p.jobs.items.len == 0);
         p.stop(p.threads);
-        p.bufs.trim(p.gpa, &p.mem, 0);
+        p.bufs.trim(p.io, p.gpa, &p.mem, 0);
+        p.maps.deinit();
+        p.tunes.deinit(p.gpa);
         p.jobs.deinit(p.gpa);
         p.gpa.free(p.threads);
         p.gpa.destroy(p);
@@ -1529,11 +1794,11 @@ const Pool = struct {
     }
 
     fn acquire(p: *Pool) void {
-        while (p.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+        p.lock.acquire(p.io);
     }
 
     fn release(p: *Pool) void {
-        p.lock.store(false, .release);
+        p.lock.release(p.io);
     }
 
     fn wake(p: *Pool) void {
@@ -1578,7 +1843,7 @@ const Pool = struct {
         for (0..n) |k| {
             const i = (p.turn + k) % n;
             const job = p.jobs.items[i];
-            if (job.inflight.load(.monotonic) >= job.max_workers or !job.mayClaim()) continue;
+            if (job.inflight.load(.monotonic) >= job.max_workers.load(.monotonic) or !job.mayClaim()) continue;
             _ = job.inflight.fetchAdd(1, .acquire);
             _ = p.busy.fetchAdd(1, .monotonic);
             p.turn = i + 1;
@@ -1595,6 +1860,14 @@ const Pool = struct {
             const seen = p.signal.load(.seq_cst);
             if (p.stopping.load(.acquire)) return;
             const job = p.take() orelse {
+                // Idle with no search running: keep at most `retain` bytes of buffers. Done
+                // here rather than by the search that ends last, which on a busy engine is
+                // as likely a small one: freeing what a large search with much output
+                // left (hundreds of MB) took 20 ms and more.
+                if (p.njobs.load(.monotonic) == 0 and p.mem.pool_bytes.load(.monotonic) > p.retain) {
+                    p.bufs.trim(p.io, p.gpa, &p.mem, p.retain);
+                    continue;
+                }
                 _ = p.sleepers.fetchAdd(1, .seq_cst);
                 p.io.futexWaitUncancelable(u32, &p.signal.raw, seen);
                 _ = p.sleepers.fetchSub(1, .seq_cst);
@@ -1608,6 +1881,160 @@ const Pool = struct {
             _ = p.busy.fetchSub(1, .monotonic);
             job.leave(&sc); // wakes the pool: the slot is free again
         }
+    }
+};
+
+/// Which file a cached mapping or tuning is of: the file's inode, size and modification
+/// time. A file written to (or truncated, or grown) gets another key. Inodes are only
+/// unique within a file system (`Io.File.Stat` has no device): two files of different file
+/// systems with the same inode number, size and modification time to the nanosecond would
+/// be taken for one.
+const FileKey = struct {
+    inode: Io.File.INode,
+    size: u64,
+    mtime: i96,
+
+    fn of(io: Io, file: Io.File) ?FileKey {
+        const st = file.stat(io) catch return null;
+        return .{ .inode = st.inode, .size = st.size, .mtime = st.mtime.nanoseconds };
+    }
+
+    fn eql(a: FileKey, b: FileKey) bool {
+        return a.inode == b.inode and a.size == b.size and a.mtime == b.mtime;
+    }
+};
+
+/// Shared engines: mappings of files kept from one search of the file to the next. A
+/// search through a fresh mapping faults its pages in and unmaps them at the end, which on
+/// an 8 MB cached file is a third of the search (unmapping alone 170 us of 0.5 ms on a
+/// Ryzen 7735U); through a kept mapping it only reads. Files up to `Pool.chunk_choice_class`
+/// only (256 MB): larger ones are read with `pread` on Linux (see `searchFile`). At most
+/// `max_entries`, the least recently used unused one making room; a kept mapping keeps its
+/// file, so a deleted file's space comes back when its mapping is dropped.
+const MapCache = struct {
+    const max_entries = 32;
+
+    const Entry = struct {
+        key: FileKey,
+        map: []align(std.heap.page_size_min) u8,
+        refs: u32,
+        used: u64,
+        /// A search saw the file shrink under it (`BusGuard`): no new search gets it, and it
+        /// is unmapped when the last one is done.
+        poisoned: bool = false,
+    };
+
+    entries: [max_entries]Entry = undefined,
+    n: usize = 0,
+    clock: u64 = 0,
+    lock: Lock = .{},
+
+    /// A mapping of the file with `key` (`size` bytes, `size` > 0): the cached one, or a
+    /// new one, cached if there is room. To be given back with `release`.
+    fn acquire(c: *MapCache, io: Io, file: Io.File, size: usize, key: FileKey) ![]align(std.heap.page_size_min) u8 {
+        {
+            c.lock.acquire(io);
+            defer c.lock.release(io);
+            c.clock += 1;
+            for (c.entries[0..c.n]) |*e| if (!e.poisoned and e.key.eql(key)) {
+                e.refs += 1;
+                e.used = c.clock;
+                return e.map;
+            };
+        }
+        const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+        var victim: ?[]align(std.heap.page_size_min) u8 = null;
+        defer if (victim) |v| unmapInSlices(v);
+        c.lock.acquire(io);
+        defer c.lock.release(io);
+        const entry: ?*Entry = if (c.n < max_entries) blk: {
+            c.n += 1;
+            break :blk &c.entries[c.n - 1];
+        } else blk: {
+            var lru: ?*Entry = null;
+            for (c.entries[0..c.n]) |*e| if (e.refs == 0 and (lru == null or e.used < lru.?.used)) {
+                lru = e;
+            };
+            if (lru) |e| victim = e.map;
+            break :blk lru;
+        };
+        // All in use: this one is the search's own.
+        const e = entry orelse return map;
+        e.* = .{ .key = key, .map = map, .refs = 1, .used = c.clock };
+        return map;
+    }
+
+    /// Gives back `map` (from `acquire`); `poisoned` if the search saw the file shrink.
+    fn release(c: *MapCache, io: Io, map: []align(std.heap.page_size_min) u8, poisoned: bool) void {
+        var unmap = true;
+        defer if (unmap) unmapInSlices(map);
+        c.lock.acquire(io);
+        defer c.lock.release(io);
+        for (c.entries[0..c.n], 0..) |*e, k| if (e.map.ptr == map.ptr) {
+            e.refs -= 1;
+            if (poisoned) e.poisoned = true;
+            if (e.poisoned and e.refs == 0) {
+                c.entries[k] = c.entries[c.n - 1];
+                c.n -= 1;
+            } else unmap = false;
+            return;
+        };
+        // Not cached (all entries were in use): unmapped.
+    }
+
+    fn deinit(c: *MapCache) void {
+        for (c.entries[0..c.n]) |e| unmapInSlices(e.map);
+        c.n = 0;
+    }
+};
+
+/// Shared engines: tuned searchers (`tunedSearcher`) by pattern and file, kept from one
+/// search to the next. Tuning reads the start of the file and tries filters on it: 16 to
+/// 70 us of a 0.5 to 1 ms search of an 8 MB file. At most `max_entries`, replaced in turn.
+const TuneCache = struct {
+    const max_entries = 64;
+
+    const Entry = struct {
+        key: FileKey,
+        /// The pattern, owned; `searcher` refers to the caller's copy only while it is used.
+        pattern: []u8,
+        searcher: search.Searcher,
+    };
+
+    entries: [max_entries]?Entry = @splat(null),
+    next: usize = 0,
+    lock: Lock = .{},
+
+    fn get(c: *TuneCache, io: Io, key: FileKey, pattern: []const u8) ?search.Searcher {
+        c.lock.acquire(io);
+        defer c.lock.release(io);
+        for (c.entries) |entry| if (entry) |e| {
+            if (!e.key.eql(key) or !std.mem.eql(u8, e.pattern, pattern)) continue;
+            var s = e.searcher;
+            s.needle = pattern;
+            s.two_way.needle = pattern;
+            return s;
+        };
+        return null;
+    }
+
+    fn put(c: *TuneCache, io: Io, gpa: std.mem.Allocator, key: FileKey, pattern: []const u8, s: search.Searcher) void {
+        const owned = gpa.dupe(u8, pattern) catch return;
+        c.lock.acquire(io);
+        defer c.lock.release(io);
+        if (c.entries[c.next]) |old| gpa.free(old.pattern);
+        var kept = s;
+        kept.needle = owned;
+        kept.two_way.needle = owned;
+        c.entries[c.next] = .{ .key = key, .pattern = owned, .searcher = kept };
+        c.next = (c.next + 1) % max_entries;
+    }
+
+    fn deinit(c: *TuneCache, gpa: std.mem.Allocator) void {
+        for (&c.entries) |*entry| if (entry.*) |e| {
+            gpa.free(e.pattern);
+            entry.* = null;
+        };
     }
 };
 
@@ -1667,15 +2094,21 @@ const BusGuard = struct {
             .linux => @intFromPtr(info.fields.sigfault.addr),
             else => @intFromPtr(info.addr),
         };
+        // Every search on the mapping is marked: searches of the same file share a cached
+        // mapping (`MapCache`), and one that is not marked would take the zeros for the file.
+        var ours = false;
         for (0..slots) |k| {
             const l = lo[k].load(.acquire);
             if (l == 0 or addr < l or addr >= hi[k].load(.acquire)) continue;
             hit[k].store(true, .release);
+            ours = true;
+        }
+        if (ours) {
             const page = std.heap.pageSize();
             const at: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(addr / page * page);
             if (std.posix.mmap(at, page, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .FIXED = true }, -1, 0)) |_| {
                 return; // the access is retried, and reads zeros
-            } else |_| break;
+            } else |_| {}
         }
         // Not one of ours (or no page could be put in): what would have happened without us.
         if (previous.flags & std.posix.SA.SIGINFO != 0) {
@@ -1714,11 +2147,21 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     const io_choice: IoChoice = if (planned) |pl| Pool.Plan.methods[pl.index] else opts.io;
 
     // Bytes in memory are searched where they are, like a mapping that never faults.
-    const mapping: ?[]align(std.heap.page_size_min) u8 = if (file) |f| try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0) else null;
-    defer if (mapping) |m| std.posix.munmap(m);
+    // Shared engines keep the mappings and tunings of files below the size where they read
+    // with `pread` (`MapCache`, `TuneCache`).
+    const cache_key: ?FileKey = if (kind == .shared and Pool.sizeClass(size) < Pool.chunk_choice_class) (if (file) |f| FileKey.of(io, f) else null) else null;
+    var poisoned = false; // set from the `BusGuard` slot before it is given back
+    const mapping: ?[]align(std.heap.page_size_min) u8 = if (file) |f|
+        (if (cache_key) |key| try pool.maps.acquire(io, f, size, key) else try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0))
+    else
+        null;
+    defer if (mapping) |m| if (cache_key != null) pool.maps.release(io, m, poisoned) else unmapInSlices(m);
     const mapped: []const u8 = mapping orelse src.bytes;
     const guard_slot: if (kind == .shared) ?usize else void = if (kind == .shared) (if (mapping) |m| try BusGuard.register(m) else null) else {};
-    defer if (kind == .shared) if (guard_slot) |k| BusGuard.unregister(k);
+    defer if (kind == .shared) if (guard_slot) |k| {
+        poisoned = BusGuard.hit[k].load(.acquire);
+        BusGuard.unregister(k);
+    };
 
     // The limit is a cap on everything zg allocates. Only part of it is spent on accounted
     // results; the rest absorbs what the accounting does not see (allocator slack, chunks
@@ -1738,10 +2181,8 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     // offsets. Every thread works on one chunk at a time, so with a small memory limit the
     // chunks shrink too (but not below `min_chunk`, where per-chunk overhead starts to show).
     const min_chunk = 256 * 1024;
-    // At most 2 MB: a chunk read with `pread` is then still in the cache when it is
-    // scanned (one thread, 512 MB cached file: 40.6 ms with 1 to 2 MB reads, 45.6 ms with
-    // 8 MB ones), while the mapped methods hardly care.
-    const max_chunk = @max(min_chunk, @min(2 * 1024 * 1024, limit / (ncpu * 16)));
+    // At most a thread's share of the L2 cache (`l2PerThread`), and at most 2 MB.
+    const max_chunk = @max(min_chunk, @min(l2PerThread(io), 2 * 1024 * 1024, limit / (ncpu * 16)));
     const chunk_size = if (opts.chunk_size != 0) opts.chunk_size else std.math.clamp(size / (ncpu * 16), min_chunk, max_chunk);
     const nchunks = (size + chunk_size - 1) / chunk_size;
 
@@ -1750,10 +2191,11 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     @memset(results, .{});
     defer for (results) |*r| {
         // Output never written (a failed writer) leaves the accounting with the rest.
-        _ = mem.queued.fetchSub(r.out.items.len + r.buf.items.len, .monotonic);
+        _ = mem.queued.fetchSub(r.out.items.len + r.buf.items.len + r.pieces.items.len, .monotonic);
         r.out.deinit(gpa);
         r.refs.deinit(gpa);
         r.buf.deinit(gpa);
+        r.pieces.deinit(gpa);
     };
     const ready = try gpa.alloc(std.atomic.Value(bool), nchunks);
     defer gpa.free(ready);
@@ -1775,11 +2217,26 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     var job: Job = .{
         .data = mapped,
         .access = .{
-            .allowed = if (mapping != null) allowedAccess(io_choice, io_mode, nchunks, .of(nthreads)) else .{ false, true, false },
+            .allowed = if (mapping == null) .{ false, true, false } else if (kind == .shared and builtin.os.tag == .linux and io_choice == .auto and Pool.sizeClass(size) >= Pool.chunk_choice_class)
+                // Shared engines on Linux, large files: `pread` only. Unmapping the pages a
+                // mapped search faulted in takes the process's address space lock for long
+                // (14 ms for 540 MB), and every other search's `mmap`, `munmap` and page
+                // faults wait for it; the search's own chunk timings cannot see that. Small
+                // searches next to one printing much output on a 540 MB file (3000 of them):
+                // longest 25.6 to 27.4 ms when that one could map, 18.6 to 19.9 ms on
+                // `pread` only (p99 about 11 ms either way).
+                .{ false, false, true }
+            else
+                allowedAccess(io_choice, io_mode, nchunks, .of(nthreads)),
             .policy = .of(nthreads),
+            .unmap_ps = unmapCost(nthreads),
         },
         .file = file,
-        .searcher = tunedSearcher(io, opts.pattern, mapped, io_mode, file),
+        .searcher = if (cache_key) |key| pool.tunes.get(io, key, opts.pattern) orelse blk: {
+            const tuned = tunedSearcher(io, opts.pattern, mapped, io_mode, file);
+            pool.tunes.put(io, gpa, key, opts.pattern, tuned);
+            break :blk tuned;
+        } else tunedSearcher(io, opts.pattern, mapped, io_mode, file),
         .chunk_size = chunk_size,
         .nchunks = nchunks,
         .line_numbers = opts.line_numbers and !opts.count_only,
@@ -1806,19 +2263,29 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     defer if (opts.cancel) |c| c.attach(null);
     // A shared engine keeps the buffers, down to what it retains while idle.
     defer switch (kind) {
-        .oneshot => own_bufs.trim(gpa, mem, 0),
-        .shared => if (pool.njobs.load(.monotonic) == 0) pool.bufs.trim(gpa, mem, pool.retain),
+        .oneshot => own_bufs.trim(io, gpa, mem, 0),
+        .shared => {}, // an idle pool thread trims (`Pool.work`)
     };
 
     switch (kind) {
         .oneshot => {
             const handles = try gpa.alloc(std.Thread, nthreads - 1);
             defer gpa.free(handles);
-            if (opts.count_only) try runPhase(&job, handles) else try runStreaming(&job, handles, w);
+            // A thread count asked for is used as is.
+            var ramp: Ramp = .init(handles, nthreads, physicalCores(io), opts.threads != 0);
+            if (ramp.state != .done) job.ramp = &ramp;
+            ramp.start(&job, ramp.initial(nchunks, opts.max_matches));
+            if (opts.count_only) try runPhase(&job, &ramp) else try runStreaming(&job, &ramp, w);
         },
         .shared => {
             job.shared = pool;
-            job.max_workers = @intCast(nthreads - 1);
+            // The pool's threads join as the search pays for them, as in a one-shot search
+            // (`Ramp`): bandwidth-bound searches leave the second thread of each core to the
+            // others. A thread count asked for is used as is.
+            var ramp: Ramp = .init(&.{}, nthreads, physicalCores(io), opts.threads != 0);
+            ramp.pool = pool;
+            if (ramp.state != .done) job.ramp = &ramp;
+            ramp.start(&job, ramp.initial(nchunks, opts.max_matches));
             const class = Pool.sizeClass(size);
             const chunk_priors = class >= Pool.chunk_choice_class;
             if (chunk_priors) pool.seed(&job.access, class, chunk_size);
@@ -1876,42 +2343,185 @@ fn writeUint(w: *Io.Writer, v: usize) Io.Writer.Error!void {
     try w.writeAll(buf[i..]);
 }
 
-fn spawnWorkers(job: *Job, handles: []std.Thread) usize {
-    job.next.store(0, .monotonic);
-    var spawned: usize = 0;
-    for (handles) |*h| {
-        h.* = std.Thread.spawn(.{}, Job.worker, .{job}) catch break;
-        spawned += 1;
-    }
-    return spawned;
-}
-
 fn checkErr(job: *const Job) !void {
     const err_code = job.err.load(.monotonic);
     if (err_code != 0) return @errorFromInt(err_code);
 }
 
-/// Runs every chunk of the job on `handles.len + 1` threads.
-fn runPhase(job: *Job, handles: []std.Thread) !void {
-    const spawned = spawnWorkers(job, handles);
-    job.worker(); // the main thread works too
-    for (handles[0..spawned]) |h| h.join();
+/// Runs every chunk of the job, on the caller and the threads `ramp` starts.
+fn runPhase(job: *Job, ramp: *Ramp) !void {
+    var sc: Scratch = .{};
+    defer sc.deinit(job.gpa);
+    while (job.workOne(&sc, true)) ramp.step(job); // the main thread works too
+    for (ramp.handles[0..ramp.spawned]) |h| h.join();
     try checkErr(job);
 }
 
 /// Runs the job and writes each chunk's output, in file order, as soon as that
 /// chunk is ready. While the next chunk is not ready the main thread works on chunks
 /// itself, so writing overlaps with searching and rendering.
-fn runStreaming(job: *Job, handles: []std.Thread, w: *Io.Writer) !void {
-    const spawned = spawnWorkers(job, handles);
+fn runStreaming(job: *Job, ramp: *Ramp, w: *Io.Writer) !void {
     var sc: Scratch = .{};
     defer sc.deinit(job.gpa);
     const written = writeChunks(job, &sc, w);
-    for (handles[0..spawned]) |h| h.join();
+    for (ramp.handles[0..ramp.spawned]) |h| h.join();
     try written;
     try checkErr(job);
     try w.flush();
 }
+
+/// How many threads a one-shot search runs, found while it runs. More threads only help
+/// while the work is not held up by memory bandwidth, and where that ends depends on the
+/// machine and on the search: on a Ryzen 7735U (8 cores, 16 hardware threads), 540 MB
+/// cached files, one thread per core against two (milliseconds, runs alternating):
+///
+///     -c needle_zz 24.3 / 26.4   ERROR 21.2 / 24.5   long.txt th 23.2 / 42.3
+///     the 41.1 / 32.6            -n a 67.3 / 47.8    -c the 30.4 / 25.4
+///
+/// The threads are started in two parts. Up to one per core they are not measured, only
+/// paced: too few threads cost far more than too many (2x on compute-bound searches,
+/// against CPU time on bandwidth-bound ones). A search with `-m` starts on the caller alone
+/// and doubles its threads each time every thread has done a chunk, since it often stops
+/// early; others start on one thread per core, fewer for small files (8 chunks each).
+///
+/// The second thread per core is the step that pays or not, and it is decided the way
+/// bandwidth-aware threading decides (Suleman et al., ASPLOS 2008): by whether the work is
+/// bandwidth bound, here the share of the `pread` chunks' time spent on what they read
+/// (scanning, rendering) rather than in the read (the copy from the page cache), over a
+/// window of chunks on one thread per core. At `smt_share` or more the extra threads have
+/// compute to overlap and start; below, they would only compete for the bandwidth. The
+/// shares measured on the cases above: 0.09 to 0.48 where one thread per core was faster,
+/// 0.52 to 0.94 where two were. Comparing throughputs before and after starting them
+/// instead was unreliable: the measurements come one after the other, while the clock rate
+/// rises after the start and drops under the power limit with all threads busy, so the
+/// later one mostly looked better. A share is measured on the same chunks at the same time.
+/// Without `pread` chunks to measure (mapped access), or for a search too short for the
+/// window, all threads start.
+/// Only the caller steps the ramp and starts threads, so it can join them all at the end.
+const Ramp = struct {
+    handles: []std.Thread,
+    /// On a shared engine: its pool, whose threads the search lets in (`Job.max_workers`)
+    /// instead of starting its own.
+    pool: ?*Pool = null,
+    /// Threads started, not counting the caller.
+    spawned: u32 = 0,
+    /// Threads working, the caller included.
+    active: u32 = 1,
+    max: u32,
+    /// One thread per physical core (`physicalCores`), at most `max`.
+    cores: u32,
+    state: enum { pace, settle, measure, done },
+    /// `job.done_chunks` when the current phase started; read and work times when the
+    /// measurement started.
+    mark_chunks: u32 = 0,
+    mark_read: u64 = 0,
+    mark_work: u64 = 0,
+
+    const smt_share = 0.5;
+    /// A share this high already over the settling chunks decides at once: the search is
+    /// plainly compute bound (0.84 to 0.94 counting `a` in short.txt, where waiting out the
+    /// measurement cost 4 ms of 30), and the highest share where one thread per core was
+    /// faster was 0.48 (0.55 over the shorter window of the settling chunks).
+    const early_share = 0.75;
+    /// Chunks per thread before the measurement (the first ones after a start are slower:
+    /// buffers, access methods tried), and in it.
+    const settle_per_thread = 2;
+    const measure_per_thread = 4;
+
+    /// A ramp over `max` threads in all, adaptive unless `fixed`.
+    fn init(handles: []std.Thread, max: usize, cores: usize, fixed: bool) Ramp {
+        return .{
+            .handles = handles,
+            .max = @intCast(max),
+            .cores = @intCast(std.math.clamp(cores, 1, max)),
+            .state = if (fixed or max == 1) .done else .pace,
+        };
+    }
+
+    /// The threads to start with: all of them for a fixed count; the caller alone with
+    /// `-m`; otherwise one per core, fewer for small files (8 chunks each at least).
+    fn initial(r: *const Ramp, nchunks: usize, max_matches: usize) u32 {
+        if (r.state == .done) return r.max;
+        if (max_matches != 0) return 1;
+        return @intCast(@max(1, @min(r.cores, nchunks / 8)));
+    }
+
+    fn start(r: *Ramp, job: *Job, n: u32) void {
+        job.next.store(0, .monotonic);
+        r.spawnUpTo(job, n);
+        r.mark_chunks = 0;
+    }
+
+    fn spawnUpTo(r: *Ramp, job: *Job, n: u32) void {
+        if (r.pool) |p| {
+            job.max_workers.store(n - 1, .monotonic);
+            r.active = n;
+            p.wake();
+            return;
+        }
+        while (r.active < n) {
+            r.handles[r.spawned] = std.Thread.spawn(.{}, Job.rampWorker, .{job}) catch {
+                r.state = .done;
+                return;
+            };
+            r.spawned += 1;
+            r.active += 1;
+        }
+    }
+
+    /// Called by the caller between chunks; cheap once the count is settled.
+    fn step(r: *Ramp, job: *Job) void {
+        if (r.state == .done) return;
+        const next = job.next.load(.monotonic);
+        if (job.halted.load(.monotonic) or next >= job.nchunks) {
+            r.state = .done;
+            return;
+        }
+        const done = job.done_chunks.load(.acquire);
+        switch (r.state) {
+            .pace => {
+                if (done -% r.mark_chunks < r.active) return;
+                if (r.active < r.cores) {
+                    r.spawnUpTo(job, @min(2 * r.active, r.cores));
+                    r.mark_chunks = job.done_chunks.load(.acquire);
+                } else if (r.active == r.max) {
+                    r.state = .done;
+                } else if (job.nchunks - next < 2 * (settle_per_thread + measure_per_thread) * r.active) {
+                    // Too short to measure: all threads.
+                    r.spawnUpTo(job, r.max);
+                    r.state = .done;
+                } else {
+                    r.mark_chunks = done;
+                    r.mark_read = job.read_ns.load(.monotonic);
+                    r.mark_work = job.work_ns.load(.monotonic);
+                    r.state = .settle;
+                }
+            },
+            .settle => {
+                if (done -% r.mark_chunks < settle_per_thread * r.active) return;
+                const read: f64 = @floatFromInt(job.read_ns.load(.monotonic) - r.mark_read);
+                const work: f64 = @floatFromInt(job.work_ns.load(.monotonic) - r.mark_work);
+                if (read != 0 and work / (read + work) >= early_share) {
+                    r.spawnUpTo(job, r.max);
+                    r.state = .done;
+                    return;
+                }
+                r.mark_chunks = done;
+                r.mark_read = job.read_ns.load(.monotonic);
+                r.mark_work = job.work_ns.load(.monotonic);
+                r.state = .measure;
+            },
+            .measure => {
+                if (done -% r.mark_chunks < measure_per_thread * r.active) return;
+                const read: f64 = @floatFromInt(job.read_ns.load(.monotonic) - r.mark_read);
+                const work: f64 = @floatFromInt(job.work_ns.load(.monotonic) - r.mark_work);
+                if (read == 0 or work / (read + work) >= smt_share) r.spawnUpTo(job, r.max);
+                r.state = .done;
+            },
+            .done => {},
+        }
+    }
+};
 
 /// The caller's part of a search on a shared engine: the pool's threads take chunks as
 /// they go round; the caller works on chunks too, and writes the output.
@@ -1919,7 +2529,7 @@ fn runOnPool(job: *Job, w: *Io.Writer) !void {
     var sc: Scratch = .{};
     defer sc.deinit(job.gpa);
     if (job.count_only) {
-        while (job.workOne(&sc, true)) {}
+        while (job.workOne(&sc, true)) if (job.ramp) |r| r.step(job);
         // Chunks still held by pool threads are done once `Pool.remove` returns.
         return;
     }
@@ -1934,6 +2544,7 @@ fn writeChunks(job: *Job, sc: *Scratch, w: *Io.Writer) !void {
     var next_write: usize = 0;
     var lines: usize = 0; // written so far, for `max_matches`
     while (next_write < job.nchunks) {
+        if (job.ramp) |r| r.step(job);
         if (job.watched and job.checkStop()) return checkErr(job);
         // Snapshot first: a chunk finishing after this point makes the wait below return at once.
         const seen = job.completed.load(.acquire);
@@ -1964,6 +2575,11 @@ fn writeChunks(job: *Job, sc: *Scratch, w: *Io.Writer) !void {
                 job.giveReadBuffer(r.buf);
                 r.buf = .empty;
             }
+            if (r.pieces.capacity != 0) {
+                _ = job.mem.queued.fetchSub(r.pieces.items.len, .monotonic);
+                r.pieces.deinit(job.gpa);
+                r.pieces = .empty;
+            }
             next_write += 1;
             job.written.store(next_write, .release);
             // Memory was freed and the head of the line moved: let gated workers re-check.
@@ -1982,7 +2598,7 @@ fn writeChunks(job: *Job, sc: *Scratch, w: *Io.Writer) !void {
             return checkErr(job);
         } else if (!job.workOne(sc, false)) {
             // Nothing to claim right now: sleep until a chunk completes.
-            job.std_io.futexWaitUncancelable(u32, &job.completed.raw, seen);
+            job.sleepOn(&job.completed, &job.completed_sleepers, seen);
         }
     }
 }
@@ -2009,6 +2625,10 @@ pub fn parseSize(text: []const u8) ?usize {
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test {
+    _ = search;
+}
 
 /// Straightforward reference: split into lines, `indexOf` each.
 fn expectedOutput(gpa: std.mem.Allocator, data: []const u8, opts: Options) ![]u8 {
@@ -2137,6 +2757,66 @@ test "output matches the reference for every io mode, thread count and chunk siz
             }
         };
     }
+}
+
+test "threads started as the search goes (no thread count given)" {
+    const gpa = testing.allocator;
+    // Enough small chunks for every phase of `Ramp`: paced starts, the measurement on one
+    // thread per core, the decision on the rest.
+    const data = try genText(gpa, 31, 20_000, "abc \n", 3000, true);
+    defer gpa.free(data);
+    for ([_][]const u8{ "a", "b c", "abcab" }) |pat| for (all_io) |io_choice| for ([_]usize{ 0, 1, 50 }) |max| {
+        for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |flags| {
+            try expectMatchesReference(data, .{
+                .pattern = pat,
+                .line_numbers = flags[0],
+                .count_only = flags[1],
+                .io = io_choice,
+                .chunk_size = 1024,
+                .max_matches = max,
+            });
+        }
+    };
+}
+
+test "a shared engine keeps mappings and tunings, and sees files change" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var engine: Engine(.shared) = try .init(testing.io, gpa, .{ .threads = 3 });
+    defer engine.deinit();
+    const Check = struct {
+        fn run(e: *Engine(.shared), dir: Io.Dir, data: []const u8, pattern: []const u8) !void {
+            const file = try dir.openFile(testing.io, "f.txt", .{});
+            defer file.close(testing.io);
+            for ([_]bool{ false, true }) |numbered| {
+                const opts: Options = .{ .pattern = pattern, .line_numbers = numbered, .chunk_size = 4096 };
+                const want = try expectedOutput(gpa, data, opts);
+                defer gpa.free(want);
+                var out: Io.Writer.Allocating = .init(gpa);
+                defer out.deinit();
+                _ = try e.search(.{ .file = file }, opts, &out.writer);
+                try testing.expectEqualStrings(want, out.written());
+            }
+        }
+    };
+    const data = try genText(gpa, 77, 30_000, "abc \n", 0, true);
+    defer gpa.free(data);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f.txt", .data = data });
+    for (0..3) |_| try Check.run(&engine, tmp.dir, data, "ab c");
+    try testing.expectEqual(@as(usize, 1), engine.pool.maps.n);
+    // Grown: another key, another mapping.
+    const grown = try std.mem.concat(gpa, u8, &.{ data, "zz ab c zz\n" });
+    defer gpa.free(grown);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f.txt", .data = grown });
+    try Check.run(&engine, tmp.dir, grown, "ab c");
+    // Rewritten in place with the same size.
+    const same_size = try gpa.dupe(u8, grown);
+    defer gpa.free(same_size);
+    @memset(same_size[0..100], 'c');
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "f.txt", .data = same_size });
+    try Check.run(&engine, tmp.dir, same_size, "ab c");
+    try Check.run(&engine, tmp.dir, same_size, "zz");
 }
 
 test "lines spanning many chunks" {

@@ -4,6 +4,11 @@ Measured 2026-10-08 on an 8-core Apple Silicon Mac (macOS, 8 GB), warm page cach
 
 Output verified identical to rg for all 39 standard and 54 worst cases.
 
+These tables predate the changes made for x86-64 Linux (page-aligned `pread`, chunk size from
+the L2 cache, the writer's handling of small chunks), which are described with the Linux
+numbers in [results-x86-linux.md](results-x86-linux.md). On Apple Silicon the chunk size stays
+2 MB; the rest has not been measured on the Mac yet.
+
 ## Warm cache, all cores
 
 | file | pattern | matching lines | output | zg ms | zg CPU/wall | rg ms | rg CPU/wall | zg speedup |

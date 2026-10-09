@@ -2,9 +2,12 @@
 //!   zig build compare -- --dir DIR [--zg PATH] [--rg PATH] [--runs N]
 //!       [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT]
 //!       [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify]
+//!       [--fail-regression PERCENT]
 //! DIR must hold the corpora written by `zig build gen`. `--case` replaces the default
 //! cases; the `ab` section alternates runs of `--zg` and `--zg-b` (on `--threads` threads)
-//! instead of comparing with ripgrep. The `small` section times its own cases (small files,
+//! instead of comparing with ripgrep, and ends with the geometric mean over its cells;
+//! `--fail-regression PERCENT` makes `compare` exit with an error when B is slower than A by
+//! more than that on that mean. The `small` section times its own cases (small files,
 //! `-m`), where fixed costs weigh, with the CPU time of both tools.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -69,6 +72,9 @@ const Config = struct {
     outputs: []const u8 = "lines,-n,-c",
     /// Second zg build for the `ab` section (runs alternate between `zg` and `zg_b`).
     zg_b: []const u8 = "",
+    /// `ab`: fail when B is slower than A by more than this many percent on the geometric
+    /// mean of the cells (0: never).
+    fail_regression: f64 = 0,
     /// Skip the check that zg and rg print the same (for experimental builds of zg).
     verify: bool = true,
 };
@@ -219,11 +225,11 @@ pub fn main(init: std.process.Init) !void {
         }
         if (i + 1 >= argv.len) return error.MissingValue;
         i += 1;
-        if (std.mem.eql(u8, a, "--dir")) cfg.dir = argv[i] else if (std.mem.eql(u8, a, "--zg")) cfg.zg = argv[i] else if (std.mem.eql(u8, a, "--rg")) cfg.rg = argv[i] else if (std.mem.eql(u8, a, "--runs")) cfg.runs = try std.fmt.parseInt(usize, argv[i], 10) else if (std.mem.eql(u8, a, "--threads")) cfg.threads = try std.fmt.parseInt(usize, argv[i], 10) else if (std.mem.eql(u8, a, "--sections")) cfg.sections = argv[i] else if (std.mem.eql(u8, a, "--zg-b")) cfg.zg_b = argv[i] else if (std.mem.eql(u8, a, "--filter")) cfg.filter = argv[i] else if (std.mem.eql(u8, a, "--outputs")) cfg.outputs = argv[i] else return error.UnknownOption;
+        if (std.mem.eql(u8, a, "--dir")) cfg.dir = argv[i] else if (std.mem.eql(u8, a, "--zg")) cfg.zg = argv[i] else if (std.mem.eql(u8, a, "--rg")) cfg.rg = argv[i] else if (std.mem.eql(u8, a, "--runs")) cfg.runs = try std.fmt.parseInt(usize, argv[i], 10) else if (std.mem.eql(u8, a, "--threads")) cfg.threads = try std.fmt.parseInt(usize, argv[i], 10) else if (std.mem.eql(u8, a, "--sections")) cfg.sections = argv[i] else if (std.mem.eql(u8, a, "--zg-b")) cfg.zg_b = argv[i] else if (std.mem.eql(u8, a, "--filter")) cfg.filter = argv[i] else if (std.mem.eql(u8, a, "--outputs")) cfg.outputs = argv[i] else if (std.mem.eql(u8, a, "--fail-regression")) cfg.fail_regression = try std.fmt.parseFloat(f64, argv[i]) else return error.UnknownOption;
     }
     if (extra_cases.items.len != 0) cases = extra_cases.items;
     if (cfg.dir.len == 0) {
-        std.debug.print("usage: compare --dir DIR [--zg PATH] [--rg PATH] [--runs N] [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT] [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify]\n", .{});
+        std.debug.print("usage: compare --dir DIR [--zg PATH] [--rg PATH] [--runs N] [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT] [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify] [--fail-regression PERCENT]\n", .{});
         return error.BadArgument;
     }
     const c: Ctx = .{ .io = io, .gpa = gpa, .cfg = cfg };
@@ -268,6 +274,7 @@ fn verify(c: Ctx) !void {
 /// changes) hits both alike; prints median and minimum wall time of each.
 fn compareBuilds(c: Ctx) !void {
     std.debug.print("\n## A/B: `{s}` (A) vs `{s}` (B), alternating runs\n\n| file | pattern | output | A median | B median | A min | B min | B vs A (median) |\n|---|---|---|---|---|---|---|---|\n", .{ c.cfg.zg, c.cfg.zg_b });
+    var ratios: std.ArrayList(f64) = .empty;
     for (cases) |cs| {
         if (!c.selected(cs)) continue;
         const file = try c.path(cs.file);
@@ -292,7 +299,27 @@ fn compareBuilds(c: Ctx) !void {
             std.debug.print("| {s} | `{s}` | {s} | {d:.1} | {d:.1} | {d:.1} | {d:.1} | {d:.2}x |\n", .{
                 cs.file, cs.pattern, out.name(), a[a.len / 2], b[b.len / 2], a[0], b[0], a[a.len / 2] / b[b.len / 2],
             });
+            try ratios.append(c.gpa, a[a.len / 2] / b[b.len / 2]);
         }
+    }
+    if (ratios.items.len == 0) return;
+    // B vs A over all cells: above 1, B is faster.
+    std.mem.sort(f64, ratios.items, {}, std.sort.asc(f64));
+    var log_sum: f64 = 0;
+    for (ratios.items) |r| log_sum += @log(r);
+    const geo = @exp(log_sum / @as(f64, @floatFromInt(ratios.items.len)));
+    const slower_by = (1 / geo - 1) * 100;
+    var worse: usize = 0;
+    for (ratios.items) |r| worse += @intFromBool(r < 0.95);
+    std.debug.print("\nB vs A over {d} cells: geometric mean {d:.3}x ({s} {d:.1} %), median {d:.3}x, worst {d:.2}x, best {d:.2}x; {d} cells more than 5 % slower\n", .{
+        ratios.items.len,                                        geo,
+        if (slower_by > 0) "B slower by" else "B faster by",     @abs(slower_by),
+        ratios.items[ratios.items.len / 2],                      ratios.items[0],
+        ratios.items[ratios.items.len - 1],                      worse,
+    });
+    if (c.cfg.fail_regression > 0 and slower_by > c.cfg.fail_regression) {
+        std.debug.print("REGRESSION: B is {d:.1} % slower than A on the geometric mean (limit {d:.1} %)\n", .{ slower_by, c.cfg.fail_regression });
+        return error.Regression;
     }
 }
 

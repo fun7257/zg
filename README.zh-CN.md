@@ -225,6 +225,16 @@ zig build stress -- corpus/words.txt small.txt   # 共享引擎上的并发搜�
 
 `compare --sections ab --zg A --zg-b B` 会改为交替运行两个 zg 版本，用于 A/B 对比；`bench --chunk=SIZE` 用指定的块大小计时。
 
+#### 性能 CI
+
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml) 在 Linux x86-64、Linux aarch64 和 macOS（Apple Silicon）上运行 `.github/bench.sh`：zg 对 ripgrep（39 个标准用例，以及小文件和 `-m` 用例）；对改动了 `src/`、`bench/` 或 `build.zig` 的 PR，还会把改动和它的基线对比，两个版本在同一台机器上交替运行，共享机器的噪声对两边的影响相同。报告在 job summary 和产物里。如果 39 个用例的几何平均比基线慢 15% 以上，检查就会失败（相同的构建在这里相差约 1%）；单个用例只能作参考。每周也会在 `main` 上跑一次，也可以手动触发，用 `base_ref`（要对比的分支、标签或提交）、`runs` 和 `threshold` 参数。在自己机器上：
+
+```
+zig build
+.github/bench.sh                          # 对 ripgrep
+.github/bench.sh --base ./zg-old --fail-regression 10   # 再与另一个构建对比
+```
+
 在 macOS 上测量的注意事项：
 - 新编译的二进制要先运行一次再计时，因为它第一次运行时会被系统扫描；
 - 页缓存的状态可能让单线程的结果相差很多，见 bench/results.md。

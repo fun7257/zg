@@ -297,6 +297,24 @@ comparisons; `bench --chunk=SIZE` times a given chunk size. On macOS, run a fres
 by the system), and note that the state of the page cache can move single-thread numbers by
 a lot (see bench/results.md).
 
+#### Performance CI
+
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs `.github/bench.sh` on Linux
+x86-64, Linux aarch64 and macOS (Apple Silicon): zg against ripgrep (the 39 standard cases and
+the small-file and `-m` cases), and on pull requests that touch `src/`, `bench/` or
+`build.zig`, the change against its base, both builds alternating on the same machine so that the
+noise of a shared runner affects them alike. The report is in the job summary and the
+artifacts. The check fails when the geometric mean over the 39 cases is more than 15 % slower
+than the base (identical builds differ by about 1 % here); read single cases as indications
+only. It also runs weekly on `main`, and by hand with `base_ref` (any branch, tag or commit to
+compare with), `runs` and `threshold`. The same on your machine:
+
+```
+zig build
+.github/bench.sh                          # against ripgrep
+.github/bench.sh --base ./zg-old --fail-regression 10   # also against another build
+```
+
 ## Limitations and roadmap
 
 - `-m` with a small N was about 3 ms slower than ripgrep on all cores on the Mac (measured

@@ -300,15 +300,18 @@ a lot (see bench/results.md).
 #### Performance CI
 
 To measure a change, merge it into the `perf` branch: pushing or merging into `perf` runs
-[`.github/workflows/bench.yml`](.github/workflows/bench.yml), which runs `.github/bench.sh` for
-each platform and CPU level below, and ends with one report of all of them (job summary, and the
-artifact `bench-summary` with `summary.md` and `results.csv`, every row of every timing table).
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml): one job per platform below, which
+runs `.github/bench.sh` for each CPU level of the platform one after the other on the same machine
+(`.github/bench-variants.sh`: a hosted runner is a different CPU model from one job to the next, so
+only levels measured in the same job can be compared), and ends with one report of all of them (job
+summary, and the artifact `bench-summary` with `summary.md` and `results.csv`, every row of every
+timing table).
 
 | platform | CPU levels |
 |---|---|
 | Linux x86-64 | native (the runner's CPU); v1 (SSE2), v2 (SSE4.2, POPCNT) and v3 (AVX2, BMI2, FMA), the three cores of the portable build run in turn; v4 (AVX-512), a build for x86-64-v4, where the runner's CPU has it |
 | Linux arm64 | native (the runner's CPU); baseline (ARMv8-A with NEON, which zg uses on every arm64 CPU) |
-| macOS arm64 (Apple Silicon) | native; baseline |
+| macOS arm64 (Apple Silicon) | native (Zig's baseline for macOS arm64 is the M1, the same build) |
 
 Each run measures zg against ripgrep on the 39 standard cases and the 54 stress cases (common
 bytes, long patterns, very long and very short lines, random bytes), on all cores and on one thread,
@@ -329,6 +332,7 @@ zig build
 .github/bench.sh --base ./zg-old --fail-regression 10   # also against another build
 .github/bench.sh --sections warm,single,worst,small,mem,cold   # everything the CI runs, and more
 zig build -Dcpu=baseline --prefix p && .github/bench.sh --bin p/bin --level v1   # one CPU level
+.github/bench-variants.sh x86 --out reports   # every level of a platform, one report each
 python3 .github/summarize.py report1.md report2.md > summary.md   # merge reports
 ```
 

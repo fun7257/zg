@@ -141,17 +141,18 @@ def main(argv):
                "Read single cases as indications and the mean as the result.\n")
 
     out.append("## zg against ripgrep: how many times faster (geometric mean over the cases; the slowest case in brackets)\n")
-    out.append("| platform and CPU level | standard, all cores | standard, one thread | worst cases, all cores | worst cases, one thread | small files and `-m` | cold read |")
-    out.append("|---|---|---|---|---|---|---|")
+    out.append("| platform and CPU level | machine | standard, all cores | standard, one thread | worst cases, all cores | worst cases, one thread | small files and `-m` | cold read |")
+    out.append("|---|---|---|---|---|---|---|---|")
     for r in reports:
         label = r["meta"].get("label", r["path"])
         if r["skipped"]:
-            out.append(f"| {label} | skipped: {r['skipped']} | | | | | |")
+            out.append(f"| {label} | skipped: {r['skipped']} | | | | | | |")
             continue
         def cell(sec):
             g, m = get(r, sec, "geo"), get(r, sec, "min")
             return "n/a" if g is None else (f"**{g:.2f}x** ({m:.2f}x)" if m else f"**{g:.2f}x**")
-        out.append(f"| {label} | {cell('warm')} | {cell('single')} | {cell('worst')} | {cell('worst1')} | {cell('small')} | {cold_speedup(r)} |")
+        cpu = re.sub(r"\s*\(\d+ CPUs\)", "", r["meta"].get("cpu", ""))
+        out.append(f"| {label} | {cpu} | {cell('warm')} | {cell('single')} | {cell('worst')} | {cell('worst1')} | {cell('small')} | {cold_speedup(r)} |")
     out.append("")
 
     out.append("## CPU time: zg over ripgrep (below 1: zg uses less CPU for the same search)\n")
@@ -197,6 +198,7 @@ def main(argv):
             continue
         out.append(f"| {m.get('label', r['path'])} | {m.get('cpu', '')} | {m.get('memory', '')} | {m.get('features', '')} | {m.get('zg', '')}{' (' + m['level'] + ')' if 'level' in m else ''} |")
     out.append("")
+    out.append("The levels of a platform ran one after the other on the same machine, so they can be compared with each other; platforms are not comparable with each other.\n")
     out.append("Each platform's full tables are in its own report (artifact `bench-*`) and every row of every "
                "table is in `results.csv`.\n")
     print("\n".join(out))

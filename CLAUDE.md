@@ -14,8 +14,8 @@ it works; this file is what is not obvious from the code.
   `stress` (shared engine under concurrency). `bench/results.md` (Apple Silicon) and
   `bench/results-x86-linux.md` (Ryzen) hold the measurements behind the numbers in the README.
 - `.github/`: `workflows/ci.yml` (tests), `workflows/bench.yml` (performance), `smoke.sh` (output
-  against `grep -F`), `bench.sh` (one benchmark run; works by hand too), `summarize.py` (merges
-  the reports of several runs).
+  against `grep -F`), `bench.sh` (one benchmark run; works by hand too), `bench-variants.sh` (every CPU level of
+  a platform, one run each), `summarize.py` (merges the reports).
 
 ## Build and test
 
@@ -74,23 +74,27 @@ on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t
 ## Performance workflow
 
 To measure a change in CI, **merge it into the `perf` branch** (create it from `main` if it does not
-exist). A push or merge into `perf` runs `bench.yml`: `.github/bench.sh` on nine platform and CPU
-level combinations, then `Report` merges them (`.github/summarize.py`: headline table, CPU time,
+exist). A push or merge into `perf` runs `bench.yml`: three platform jobs, each running
+`.github/bench.sh` for every CPU level of its platform, then `Report` merges them (`.github/summarize.py`: headline table, CPU time,
 change against the base, a few cases side by side, the machines; plus `results.csv`).
 
-- Linux x86-64: native; v1, v2, v3 (the portable build's three cores, run in turn with
-  `ZG_CPU_LEVEL`); v4 (`-Dcpu=x86_64_v4`, only where the runner's CPU has AVX-512).
-- Linux arm64: native; baseline. macOS arm64: native; baseline.
+- One job per platform, and in it every CPU level one after the other (`.github/bench-variants.sh`):
+  hosted runners are a different CPU model from job to job (EPYC 7763, EPYC 9V74, Xeon 8573C and
+  6973P-C were seen), so levels measured in different jobs cannot be compared.
+- Linux x86-64: v1, v2, v3 (the portable build's three cores, run in turn with `ZG_CPU_LEVEL`); v4
+  (`-Dcpu=x86_64_v4`, only where the CPU has AVX-512, else a "skipped" report); native.
+  Linux arm64: baseline; native. macOS arm64: native only (Zig's baseline there is the M1).
 - Each measures zg against rg (39 standard cases, 54 stress cases, all cores and one thread, small
   files and `-m`; the native runs also memory, and on Linux the cold read), and the new `perf`
   against the one before the push, alternating. It fails when the geometric mean over the 39 cases
   is more than 15 % slower. Pull requests do not trigger it. By hand: the `Performance` workflow with
   `base_ref` (any ref to compare with).
-- Adding a platform or a level is a matrix entry in `bench.yml` (`id`, `name`, `os`, `flags`,
-  `level`, `sections`). `summarize.py` reads `compare`'s text (the `## ` headings and the
+- Adding a platform is a matrix entry in `bench.yml` plus a case in `bench-variants.sh`; a level is
+  a line in the case of its platform there. `summarize.py` reads `compare`'s text (the `## ` headings and the
   `speedup over N cells` lines): change them together. `compare` has a built-in `worst` section.
-- zg has no AVX-512 or SVE code. The hosted runners have an AMD EPYC (Zen 4: AVX-512) and a
-  Neoverse N2 (SVE2), so that is where such a kernel could be checked.
+- zg has no AVX-512 or SVE code. Some hosted x86-64 runners have AVX-512 (EPYC 9V74, Xeon 8573C;
+  not the EPYC 7763), and the arm64 runner is a Neoverse N2 (SVE2): that is where such a kernel could
+  be checked.
 
 ## Conventions
 

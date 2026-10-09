@@ -227,13 +227,13 @@ zig build stress -- corpus/words.txt small.txt   # 共享引擎上的并发搜�
 
 #### 性能 CI
 
-想测一个改动的性能，就把它合并进 `perf` 分支：向 `perf` 推送或合并会触发 [`.github/workflows/bench.yml`](.github/workflows/bench.yml)，它对下表的每个平台和 CPU 级别运行 `.github/bench.sh`，最后合成一份总报告（job summary，以及产物 `bench-summary`：`summary.md` 和 `results.csv`，后者是所有计时表的每一行）。
+想测一个改动的性能，就把它合并进 `perf` 分支：向 `perf` 推送或合并会触发 [`.github/workflows/bench.yml`](.github/workflows/bench.yml)，每个平台一个任务，任务里依次对该平台的每个 CPU 级别运行 `.github/bench.sh`（`.github/bench-variants.sh`），它们在同一台机器上跑：GitHub 托管机器的 CPU 型号每个任务都可能不同，所以只有在同一个任务里测出的级别才能互相比较。最后合成一份总报告（job summary，以及产物 `bench-summary`：`summary.md` 和 `results.csv`，后者是所有计时表的每一行）。
 
 | 平台 | CPU 级别 |
 |---|---|
 | Linux x86-64 | native（运行机器自己的 CPU）；v1（SSE2）、v2（SSE4.2、POPCNT）、v3（AVX2、BMI2、FMA），即可移植构建里的三份核心依次运行；v4（AVX-512），按 x86-64-v4 编译的构建，只在运行机器的 CPU 支持时运行 |
 | Linux arm64 | native（运行机器自己的 CPU）；baseline（ARMv8-A 加 NEON，zg 在所有 arm64 CPU 上用的就是它） |
-| macOS arm64（Apple Silicon） | native；baseline |
+| macOS arm64（Apple Silicon） | native（Zig 在 macOS arm64 上的 baseline 就是 M1，是同一个构建） |
 
 每次运行测量 zg 对 ripgrep：39 个标准用例和 54 个最坏用例（常见字节、长模式、极长和极短的行、随机字节），全核和单线程各一遍，以及小文件和 `-m`；每个平台的 native 运行还测峰值内存，Linux 上还测第一次从磁盘读（macOS 不测冷读：运行机器的磁盘太小，放不下需要的拷贝）。还会把 `perf` 的新状态和推送之前的状态对比，两个版本在同一台机器上交替运行，共享机器的噪声对两边影响相同；39 个用例的几何平均慢 15% 以上就会失败（相同的构建在这里相差 1% 到 2%）；单个用例只能作参考。连续的推送会排队，不会互相取代。每周也会在 `main` 上跑一次（只对 ripgrep），也可以手动触发，用 `base_ref`（要对比的分支、标签或提交）、`runs` 和 `threshold` 参数。zg 自己没有 AVX-512 或 SVE 的代码：v4 和 native 两行显示的是让编译器使用这些指令的效果。在自己机器上：
 
@@ -243,6 +243,7 @@ zig build
 .github/bench.sh --base ./zg-old --fail-regression 10   # 再与另一个构建对比
 .github/bench.sh --sections warm,single,worst,small,mem,cold   # CI 跑的全部内容，再加上冷读
 zig build -Dcpu=baseline --prefix p && .github/bench.sh --bin p/bin --level v1   # 指定一个 CPU 级别
+.github/bench-variants.sh x86 --out reports   # 一个平台的所有级别，各出一份报告
 python3 .github/summarize.py report1.md report2.md > summary.md   # 合并报告
 ```
 

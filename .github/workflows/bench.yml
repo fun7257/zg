@@ -1,0 +1,125 @@
+name: Performance
+
+# Runs when something is pushed or merged into the `perf` branch: to measure a change, merge it
+# into `perf`. zg against ripgrep on each platform, and the new state of the branch against its
+# previous one (the commit `perf` pointed to before the push): both builds run alternately on the
+# same machine, so the noise of a shared runner affects them alike. The report is in the job
+# summary and, as a file, in the artifacts. The run fails when the geometric mean over the cases
+# is more than `threshold` percent slower than the previous state. Runners are shared machines:
+# read single cases as indications, the mean as the result. Also weekly on the default branch
+# (against ripgrep only), and by hand with a ref to compare with.
+
+on:
+  push:
+    branches: [perf]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Also compare with this branch, tag or commit (A/B against it)"
+        required: false
+        default: ""
+      runs:
+        description: "Runs per case"
+        required: false
+        default: "11"
+      threshold:
+        description: "Fail when slower than the base by more than this many percent (0: never)"
+        required: false
+        default: "15"
+
+permissions:
+  contents: read
+
+# A push to `perf` waits for the run before it (each one is a measurement worth keeping);
+# the others replace a run in progress.
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  RUNS: ${{ inputs.runs || '11' }}
+  THRESHOLD: ${{ inputs.threshold || '15' }}
+
+jobs:
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            os: ubuntu-latest
+          - name: Linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macOS aarch64
+            os: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install ripgrep
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            brew install ripgrep
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ripgrep
+          fi
+
+      - name: Build
+        run: zig build
+
+      # What to compare with: where `perf` was before this push, or the ref asked for by hand.
+      - name: Build the base
+        id: base
+        env:
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          ref="${BASE_REF:-$BEFORE}"
+          case "$ref" in 0*[!0]*) ;; 0*) ref="" ;; esac # a new branch: all zeros
+          if [ -n "$ref" ] && ! git cat-file -e "$ref^{commit}" 2>/dev/null; then
+            echo "$ref is not in the history (a forced push?)."
+            ref=""
+          fi
+          if [ -z "$ref" ]; then
+            echo "No base: zg against ripgrep only."
+            exit 0
+          fi
+          git worktree add "$RUNNER_TEMP/base" "$ref"
+          (cd "$RUNNER_TEMP/base" && zig build)
+          cp "$RUNNER_TEMP/base/zig-out/bin/zg" "$RUNNER_TEMP/zg-base"
+          echo "binary=$RUNNER_TEMP/zg-base" >> "$GITHUB_OUTPUT"
+
+      - name: Benchmark
+        shell: bash
+        env:
+          BASE_BINARY: ${{ steps.base.outputs.binary }}
+        run: |
+          args=(--runs "$RUNS")
+          if [ -n "$BASE_BINARY" ]; then
+            args+=(--base "$BASE_BINARY" --fail-regression "$THRESHOLD")
+          fi
+          echo "## ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          .github/bench.sh "${args[@]}" > bench.md
+          status=$?
+          set -e
+          cat bench.md >> "$GITHUB_STEP_SUMMARY"
+          cat bench.md
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ runner.os }}-${{ runner.arch }}
+          path: bench.md

@@ -2,3 +2,5 @@
 zig-out/
 .zg-bench.tmp
 portable/
+bench-corpus
+bench.md

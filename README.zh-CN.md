@@ -43,6 +43,17 @@ zg --version
 
 **搜索过程中文件被截断**（别的进程把它变短）会以 `zg: app.log: the file changed while it was being searched` 结束，退出码 2，进程不会被 SIGBUS 杀死（macOS 上 zg 用的私有映射仍显示旧内容，搜索会正常结束）。
 
+## 安装
+
+预编译的程序在[发布页](https://github.com/fun7257/zg/releases)：Linux x86-64（一个静态二进制，内含 SSE2、SSE4.2、AVX2 三份核心，启动时选择）、Linux arm64，以及 Apple Silicon 的 macOS。下载后用 `SHA256SUMS` 校验，解压，把 `zg` 放进 `PATH`：
+
+```
+tar xzf zg-0.1.0-x86_64-linux.tar.gz
+install zg-0.1.0-x86_64-linux/zg ~/.local/bin/
+```
+
+macOS 的程序没有经过公证：如果是用浏览器下载的，macOS 拒绝打开时，执行一次 `xattr -d com.apple.quarantine zg`。想自己编译，见下文。
+
 ## 构建
 
 需要 [Zig 0.16.0](https://ziglang.org/download/)。

@@ -90,5 +90,5 @@ if [ -n "$base" ]; then
     --fail-regression "$fail" 2>&1 || status=$?
   echo
 fi
-"$bin/compare" --dir "$dir" --runs "$runs" --sections "$sections" 2>&1
+"$bin/compare" --dir "$dir" --runs "$runs" --sections "$sections" --zg "$bin/zg" 2>&1
 exit "$status"

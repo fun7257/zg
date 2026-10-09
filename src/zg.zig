@@ -32,6 +32,13 @@ pub const Options = struct {
     /// output's size can be had from the writer: one that fails past the cap stops the
     /// search at once, with `error.WriteFailed`.)
     max_matches: usize = 0,
+    /// A file that shrinks while it is mapped (another process truncates it) raises SIGBUS on
+    /// the pages past its new end, which kills the process. With this set, the search catches
+    /// the signal and ends with `error.FileChanged`, as searches on a shared engine always do.
+    /// Off by default for one-shot searches because the handler is process-wide: it is installed
+    /// by the first search that asks, stays installed, and passes SIGBUS from anywhere else on to
+    /// the handler that was there before. The command line tool sets it.
+    truncation_guard: bool = false,
 };
 
 /// What a search reads: a file, or bytes already in memory (a request body, say).
@@ -631,7 +638,8 @@ const Job = struct {
     watched: bool = false,
     cancel: ?*Cancel = null,
     deadline: ?Io.Timestamp = null,
-    /// Shared engines: the mapping's `BusGuard` slot.
+    /// The mapping's `BusGuard` slot (shared engines, and one-shot searches with
+    /// `Options.truncation_guard`).
     bus_slot: ?usize = null,
     /// `Options.max_matches`; with `count_only`, the matching lines of finished chunks so
     /// far, to stop as soon as there are enough.
@@ -2162,8 +2170,12 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
         null;
     defer if (mapping) |m| if (cache_key != null) pool.maps.release(io, m, poisoned) else unmapInSlices(m);
     const mapped: []const u8 = mapping orelse src.bytes;
-    const guard_slot: if (kind == .shared) ?usize else void = if (kind == .shared) (if (mapping) |m| try BusGuard.register(m) else null) else {};
-    defer if (kind == .shared) if (guard_slot) |k| {
+    const guard_slot: ?usize = if (kind == .shared or opts.truncation_guard) blk: {
+        const m = mapping orelse break :blk null;
+        BusGuard.install(); // shared engines did at creation; the first guarded one-shot search does
+        break :blk try BusGuard.register(m);
+    } else null;
+    defer if (guard_slot) |k| {
         poisoned = BusGuard.hit[k].load(.acquire);
         BusGuard.unregister(k);
     };
@@ -2258,10 +2270,10 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
             .shared => &pool.bufs,
         },
         .nthreads = nthreads,
-        .watched = kind == .shared or opts.cancel != null or deadline != null,
+        .watched = kind == .shared or guard_slot != null or opts.cancel != null or deadline != null,
         .cancel = opts.cancel,
         .deadline = deadline,
-        .bus_slot = if (kind == .shared) guard_slot else null,
+        .bus_slot = guard_slot,
         .max_matches = opts.max_matches,
     };
     if (opts.cancel) |c| c.attach(&job);
@@ -2302,7 +2314,7 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
         },
     }
     try checkErr(&job); // a stopped count is incomplete
-    if (kind == .shared) if (guard_slot) |k| if (BusGuard.hit[k].load(.acquire)) return error.FileChanged;
+    if (guard_slot) |k| if (BusGuard.hit[k].load(.acquire)) return error.FileChanged;
     // A count stopped at `max_matches` has enough lines; the pending lines it left
     // undecided cannot change that.
     const enough = job.halted.load(.acquire);
@@ -3371,6 +3383,48 @@ test "a file truncated during a search never brings the process down" {
     defer out.deinit();
     _ = try engine.search(.{ .file = other }, .{ .pattern = "c a", .line_numbers = true }, &out.writer);
     try testing.expectEqualStrings(want, out.written());
+}
+
+test "a one-shot search with the truncation guard survives the file being truncated" {
+    const gpa = testing.allocator;
+    const data = try genText(gpa, 53, 60_000, "ab c", 0, true);
+    defer gpa.free(data);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const Truncate = struct {
+        fn run(f: Io.File, sw: *SlowWriter) void {
+            while (sw.writes.load(.monotonic) < 5) std.atomic.spinLoopHint();
+            f.setLength(testing.io, 0) catch unreachable;
+        }
+    };
+    var engine: Engine(.oneshot) = .init(testing.io, gpa);
+    for ([_]IoChoice{ .mmap, .pread }) |io_choice| for ([_]bool{ false, true }) |numbered| {
+        try tmp.dir.writeFile(testing.io, .{ .sub_path = "input.txt", .data = data });
+        const file = try tmp.dir.openFile(testing.io, "input.txt", .{ .mode = .read_write });
+        defer file.close(testing.io);
+        const opts: Options = .{
+            .pattern = "a",
+            .line_numbers = numbered,
+            .io = io_choice,
+            .chunk_size = 4096,
+            .threads = 4,
+            .memory_limit = 64 << 10,
+            .truncation_guard = true,
+        };
+        var sw = SlowWriter.init(gpa, 500);
+        defer sw.out.deinit();
+        const t = try std.Thread.spawn(.{}, Truncate.run, .{ file, &sw });
+        const result = engine.search(.{ .file = file }, opts, &sw.w);
+        t.join();
+        if (result) |_| {
+            // Only a mapping that keeps showing the old contents (macOS) gets here.
+            try testing.expect(io_choice == .mmap and builtin.os.tag.isDarwin());
+            const want = try expectedOutput(gpa, data, opts);
+            defer gpa.free(want);
+            try testing.expectEqualStrings(want, sw.out.written());
+        } else |err| try testing.expectEqual(error.FileChanged, err);
+    };
 }
 
 test "a shared engine plans small searches from earlier ones and keeps measuring the others" {

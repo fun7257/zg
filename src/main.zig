@@ -21,9 +21,10 @@ pub const std_options: std.Options = .{
 };
 
 const usage =
-    \\usage: zg [-n] [-c] [-m N] [-j N] [--io=M] [--mem=S] [--] PATTERN FILE
+    \\usage: zg [-n] [-c] [-m N] [-j N] [--io=M] [--mem=S] [--] PATTERN [FILE]
     \\       zg --version
     \\  Case-sensitive literal, line-oriented search (SIMD + multi-threaded).
+    \\  FILE     the file to search; without it, or as -, standard input
     \\  -n       prefix matching lines with line numbers
     \\  -c       print only the number of matching lines
     \\  -m N     stop after N matching lines
@@ -31,15 +32,23 @@ const usage =
     \\  --io=M   how to read the file: auto (default), mmap or pread
     \\  --mem=S  cap on the memory zg allocates, e.g. 512M or 4G (default: what the
     \\           system can give without swapping, at most half of RAM)
+    \\  -F, -a   accepted and ignored (zg searches for a literal in bytes)
+    \\  Standard input that is a pipe (and any other file that is not a regular one) is
+    \\  read into memory first, up to the limit of --mem; a regular file given as standard
+    \\  input (zg PATTERN < file) is searched in place, from its beginning.
+    \\  Exit status: 0 if a line matched, 1 if none did, 2 on errors.
     \\
 ;
 
 fn Cli(comptime Zg: type) type {
     return struct {
         opts: Zg.Options,
-        path: []const u8,
+        /// The file to search; null: standard input.
+        path: ?[]const u8,
         /// `--version`: print what this build is and runs, nothing else.
         version: bool = false,
+        /// `--help`: print the usage on standard output.
+        help: bool = false,
     };
 }
 
@@ -48,8 +57,63 @@ fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(2);
 }
 
+/// What an error means to a user: the system's wording for the common ones, else the name of
+/// the error as words ("MemoryMappingNotSupported": "memory mapping not supported").
+fn describe(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "No such file or directory",
+        error.AccessDenied, error.PermissionDenied => "Permission denied",
+        error.IsDir => "Is a directory",
+        error.NotDir => "Not a directory",
+        error.NameTooLong => "File name too long",
+        error.SymLinkLoop => "Too many levels of symbolic links",
+        error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => "Too many open files",
+        error.OutOfMemory => "Out of memory",
+        error.InputOutput => "Input/output error",
+        error.BrokenPipe => "Broken pipe",
+        error.FileTooLarge => "File too large for this system",
+        error.FileChanged => "the file changed while it was being searched",
+        else => words(err),
+    };
+}
+
+var words_buf: [128]u8 = undefined;
+
+fn words(err: anyerror) []const u8 {
+    const name = @errorName(err);
+    var n: usize = 0;
+    for (name, 0..) |c, i| {
+        if (n + 2 >= words_buf.len) break;
+        if (std.ascii.isUpper(c)) {
+            if (i != 0) {
+                words_buf[n] = ' ';
+                n += 1;
+            }
+            words_buf[n] = std.ascii.toLower(c);
+        } else words_buf[n] = c;
+        n += 1;
+    }
+    return words_buf[0..n];
+}
+
+/// Letters of grep and ripgrep options that zg does not have: say so, instead of "unknown
+/// option".
+const unsupported_letters = "ivorREPGwxlLHhqszbBACeSTUZ";
+
+const unsupported_long = [_][]const u8{
+    "--ignore-case",         "--invert-match",  "--only-matching", "--recursive",      "--regexp",
+    "--extended-regexp",     "--perl-regexp",   "--word-regexp",   "--line-regexp",    "--files-with-matches",
+    "--files-without-match", "--with-filename", "--no-filename",   "--quiet",          "--silent",
+    "--color",               "--colour",        "--after-context", "--before-context", "--context",
+    "--null",                "--null-data",     "--byte-offset",   "--smart-case",
+};
+
+fn unsupportedOption(comptime fmt_name: []const u8, name: anytype) noreturn {
+    fail("option '" ++ fmt_name ++ "' is not supported: zg searches for a case-sensitive literal in one file or standard input (zg --help)", .{name});
+}
+
 fn parseArgs(comptime Zg: type, argv: []const [:0]const u8) Cli(Zg) {
-    var opts: Zg.Options = .{ .pattern = "" };
+    var opts: Zg.Options = .{ .pattern = "", .truncation_guard = true };
     var positional: [2][]const u8 = undefined;
     var np: usize = 0;
     var i: usize = 1;
@@ -57,43 +121,63 @@ fn parseArgs(comptime Zg: type, argv: []const [:0]const u8) Cli(Zg) {
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
         if (flags_done or a.len == 0 or a[0] != '-' or a.len == 1) {
-            if (np == 2) fail("too many arguments\n{s}", .{usage});
+            if (np == 2) fail("too many arguments: zg searches one file (or standard input)\n{s}", .{usage});
             positional[np] = a;
             np += 1;
         } else if (std.mem.eql(u8, a, "--")) {
             flags_done = true;
-        } else if (std.mem.eql(u8, a, "-n")) {
-            opts.line_numbers = true;
-        } else if (std.mem.eql(u8, a, "-c")) {
-            opts.count_only = true;
-        } else if (std.mem.eql(u8, a, "-m")) {
-            i += 1;
-            if (i >= argv.len) fail("-m needs a value", .{});
-            opts.max_matches = std.fmt.parseInt(usize, argv[i], 10) catch fail("bad match count '{s}'", .{argv[i]});
-            if (opts.max_matches == 0) std.process.exit(1); // no line wanted: none matches (as grep -m 0)
-        } else if (std.mem.eql(u8, a, "-j")) {
-            i += 1;
-            if (i >= argv.len) fail("-j needs a value", .{});
-            opts.threads = std.fmt.parseInt(usize, argv[i], 10) catch fail("bad thread count '{s}'", .{argv[i]});
+        } else if (std.mem.eql(u8, a, "--fixed-strings") or std.mem.eql(u8, a, "--text")) {
+            // zg always searches for a literal, in bytes
         } else if (std.mem.startsWith(u8, a, "--io=")) {
-            opts.io = std.meta.stringToEnum(Zg.IoChoice, a["--io=".len..]) orelse fail("bad --io value '{s}'", .{a});
+            opts.io = std.meta.stringToEnum(Zg.IoChoice, a["--io=".len..]) orelse fail("bad --io value '{s}' (auto, mmap or pread)", .{a["--io=".len..]});
         } else if (std.mem.startsWith(u8, a, "--mem=")) {
-            opts.memory_limit = Zg.parseSize(a["--mem=".len..]) orelse fail("bad --mem value '{s}' (examples: 512M, 4G)", .{a});
+            opts.memory_limit = Zg.parseSize(a["--mem=".len..]) orelse fail("bad --mem value '{s}' (examples: 512M, 4G)", .{a["--mem=".len..]});
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
-            return .{ .opts = opts, .path = "", .version = true };
+            return .{ .opts = opts, .path = null, .version = true };
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            std.debug.print("{s}", .{usage});
-            std.process.exit(0);
+            return .{ .opts = opts, .path = null, .help = true };
+        } else if (a[1] == '-') {
+            for (unsupported_long) |l| if (std.mem.startsWith(u8, a, l)) unsupportedOption("{s}", a);
+            fail("unknown option '{s}' (use -- before a pattern that starts with '-'; zg --help)", .{a});
         } else {
-            fail("unknown option '{s}' (use -- before a pattern that starts with '-')\n{s}", .{ a, usage });
+            // Short options, alone or together (-nc, -m5, -nm 5): the ones with a value take
+            // the rest of the argument, or the next argument.
+            var k: usize = 1;
+            while (k < a.len) : (k += 1) {
+                switch (a[k]) {
+                    'n' => opts.line_numbers = true,
+                    'c' => opts.count_only = true,
+                    'F', 'a' => {}, // zg always searches for a literal, in bytes
+                    'm', 'j' => |letter| {
+                        var value: []const u8 = a[k + 1 ..];
+                        if (value.len == 0) {
+                            i += 1;
+                            if (i >= argv.len) fail("-{c} needs a value", .{letter});
+                            value = argv[i];
+                        }
+                        if (letter == 'm') {
+                            opts.max_matches = std.fmt.parseInt(usize, value, 10) catch fail("bad match count '{s}'", .{value});
+                            if (opts.max_matches == 0) std.process.exit(1); // no line wanted: none matches (as grep -m 0)
+                        } else {
+                            opts.threads = std.fmt.parseInt(usize, value, 10) catch fail("bad thread count '{s}'", .{value});
+                        }
+                        break;
+                    },
+                    else => |c| {
+                        if (std.mem.indexOfScalar(u8, unsupported_letters, c) != null) unsupportedOption("-{c}", c);
+                        fail("unknown option '-{c}' (use -- before a pattern that starts with '-'; zg --help)", .{c});
+                    },
+                }
+            }
         }
     }
-    if (np != 2) {
+    if (np == 0) {
         std.debug.print("{s}", .{usage});
         std.process.exit(2);
     }
     opts.pattern = positional[0];
-    return .{ .opts = opts, .path = positional[1] };
+    const path: ?[]const u8 = if (np == 2 and !std.mem.eql(u8, positional[1], "-")) positional[1] else null;
+    return .{ .opts = opts, .path = path };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -110,6 +194,36 @@ pub fn main(init: std.process.Init) !void {
     return run(zg, init, null);
 }
 
+/// What to search: the file, or the contents of standard input (or of a pipe, device or
+/// other file that is not a regular one) read into memory. `name` is how errors name it.
+fn openInput(comptime Zg: type, init: std.process.Init, path: ?[]const u8, cap: usize, name: *[]const u8) Zg.Source {
+    const io = init.io;
+    name.* = path orelse "standard input";
+    const file = if (path) |p|
+        Io.Dir.cwd().openFile(io, p, .{}) catch |err| fail("{s}: {s}", .{ p, describe(err) })
+    else
+        Io.File.stdin();
+    const st = file.stat(io) catch |err| fail("{s}: {s}", .{ name.*, describe(err) });
+    switch (st.kind) {
+        .directory => fail("{s}: Is a directory (zg searches one file; use grep -r or rg for a tree)", .{name.*}),
+        // A regular file is searched in place. (Size 0 can be an empty file, or one the
+        // system makes up as it is read, like those in /proc: read it.)
+        .file => if (st.size > 0) return .{ .file = file },
+        else => {},
+    }
+    if (path == null and (file.isTty(io) catch false)) {
+        fail("no FILE given and standard input is a terminal\n{s}", .{usage});
+    }
+    var buf: [64 * 1024]u8 = undefined;
+    var reader = file.readerStreaming(io, &buf);
+    const data = reader.interface.allocRemaining(init.gpa, .limited(cap)) catch |err| switch (err) {
+        error.StreamTooLong => fail("{s}: more than {d} MB of input, which zg holds in memory (the limit is half of the memory, or --mem): save it to a file and search that", .{ name.*, cap >> 20 }),
+        error.ReadFailed => fail("{s}: {s}", .{ name.*, describe(reader.err orelse error.InputOutput) }),
+        error.OutOfMemory => fail("{s}: Out of memory reading the input", .{name.*}),
+    };
+    return .{ .bytes = data };
+}
+
 /// The command line tool on the core `Zg` (`zg`, or one of its copies in `levels`), the
 /// one for `level` in a build with several.
 fn run(comptime Zg: type, init: std.process.Init, level: ?Level) !void {
@@ -120,18 +234,30 @@ fn run(comptime Zg: type, init: std.process.Init, level: ?Level) !void {
         printVersion(io, level);
         std.process.exit(0);
     }
+    if (cli.help) {
+        var hbuf: [2048]u8 = undefined;
+        var hw = Io.File.stdout().writerStreaming(io, &hbuf);
+        hw.interface.writeAll(usage) catch {};
+        hw.interface.flush() catch {};
+        std.process.exit(0);
+    }
 
-    const file = Io.Dir.cwd().openFile(io, cli.path, .{}) catch |err| fail("{s}: {t}", .{ cli.path, err });
-    defer file.close(io);
+    // Standard input is held in memory up to the memory limit of --mem, by default half of
+    // the physical memory.
+    const cap = if (cli.opts.memory_limit != 0) cli.opts.memory_limit else (std.process.totalSystemMemory() catch 2 << 30) / 2;
+    var name: []const u8 = undefined;
+    const source = openInput(Zg, init, cli.path, cap, &name);
 
     var out_buf: [64 * 1024]u8 = undefined;
     var fw = Io.File.stdout().writerStreaming(io, &out_buf);
     // A one-shot engine: the search starts its threads and works out its memory limit.
     var engine: Zg.Engine(.oneshot) = .init(io, init.gpa);
-    const total = engine.search(.{ .file = file }, cli.opts, &fw.interface) catch |err| switch (err) {
+    const total = engine.search(source, cli.opts, &fw.interface) catch |err| switch (err) {
         // A closed stdout (e.g. `| head`) is not an error: stop quietly.
         error.WriteFailed => std.process.exit(0),
-        else => fail("{s}: {t}", .{ cli.path, err }),
+        error.EmptyPattern => fail("the pattern is empty", .{}),
+        error.PatternHasNewline => fail("the pattern contains a newline: zg searches line by line", .{}),
+        else => fail("{s}: {s}", .{ name, describe(err) }),
     };
     std.process.exit(if (total > 0) 0 else 1);
 }

@@ -42,6 +42,10 @@ jobs:
       - name: Output against grep -F
         run: .github/smoke.sh zig-out/bin/zg
 
+      # Standard input, error messages, options, a file truncated during a search.
+      - name: Command line
+        run: .github/cli-tests.sh zig-out/bin/zg
+
       # The portable build carries cores for x86-64 v1, v2 and v3 and picks one at start-up:
       # test each core, and the binary at each level the runner supports.
       - name: Unit tests at each x86-64 level
@@ -53,3 +57,4 @@ jobs:
         run: |
           zig build -Dcpu=baseline --prefix portable
           .github/smoke.sh portable/bin/zg v1 v2 v3
+          for level in v1 v2 v3; do ZG_CPU_LEVEL=$level .github/cli-tests.sh portable/bin/zg; done

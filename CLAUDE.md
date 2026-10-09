@@ -9,12 +9,13 @@ it works; this file is what is not obvious from the code.
 - `src/search.zig`: SIMD primitives (filter, Two-Way fallback, newline scans).
 - `src/zg.zig`: the engine (chunks, access methods, writer, one-shot and shared engines, thread
   ramp, caches). Tests are in the same file; `zig build test` runs them.
-- `src/main.zig`: the command line, `--version`, and the choice of CPU level at start-up.
+- `src/main.zig`: the command line (options, standard input, error wording), `--version`, and the
+  choice of CPU level at start-up.
 - `bench/`: `gen` (corpora), `compare` (zg against rg, A/B of two zg builds), `bench` (in-process),
   `stress` (shared engine under concurrency). `bench/results.md` (Apple Silicon) and
   `bench/results-x86-linux.md` (Ryzen) hold the measurements behind the numbers in the README.
 - `.github/`: `workflows/ci.yml` (tests), `workflows/bench.yml` (performance), `smoke.sh` (output
-  against `grep -F`), `bench.sh` (one benchmark run; works by hand too), `bench-variants.sh` (every CPU level of
+  against `grep -F`), `cli-tests.sh` (standard input, error messages, options, truncation), `bench.sh` (one benchmark run; works by hand too), `bench-variants.sh` (every CPU level of
   a platform, one run each), `summarize.py` (merges the reports).
 
 ## Build and test
@@ -25,6 +26,7 @@ zig build test               # ReleaseSafe; add -Dtest-optimize=Debug for Debug
 zig build test-levels        # the tests for x86-64 v1, v2, v3, as far as the machine runs them
 zig build -Dcpu=baseline     # the portable x86-64 build (cores for v2 and v3 inside)
 .github/smoke.sh zig-out/bin/zg [v1 v2 v3]   # output against grep -F (levels: portable build)
+.github/cli-tests.sh zig-out/bin/zg          # the command line's behaviour (run from the repo root)
 ```
 
 Before a push: ReleaseSafe and Debug tests, and `test-levels` on x86-64. Cross-compile checks
@@ -43,6 +45,13 @@ on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t
   x86-64 v2 and v3 as copies in other modules (`build.zig`). Zig takes the target CPU per module,
   and a file belongs to one module. So `zg.zig` may import only `search.zig` (plus std/builtin): a
   new source file has to be added to the copy list in `build.zig`, or the portable build fails.
+- **Command line behaviour is tested in `cli-tests.sh`**, not only the output: a change to options,
+  messages, standard input or exit statuses goes with a check there. Standard input that is not a
+  regular file is read into memory (`openInput` in `main.zig`); the search then runs on
+  `Source.bytes`. Messages: `describe` maps the common errors to the system's wording, the rest
+  to the error's name as words.
+- **The command line sets `Options.truncation_guard`** (the SIGBUS handler for one-shot
+  searches). Without it a file truncated during an `mmap` search kills the process.
 - **Root files set `std_options.signal_stack_size = null`** outside Debug (main, bench, stress):
   the default 256 KB signal stack per thread made a thread start ~7x slower (130 vs 17 us).
 - **Vector width** is 16 bytes without AVX2 (SSE2, NEON), 32 with: 32 on SSE2 was twice as slow.

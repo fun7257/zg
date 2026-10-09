@@ -18,9 +18,11 @@ zg 搜索一个精确、区分大小写的字节串，输出包含它的行，�
 ## 命令行
 
 ```
-zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
+zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN [FILE]
 zg --version
 ```
+
+不给 `FILE`，或给 `-`，就搜索标准输入：`some-command | zg ERROR`。短选项可以合并，值可以紧跟在选项后：`-nc`、`-m5`、`-nm 5`。
 
 | 选项 | |
 |---|---|
@@ -30,9 +32,16 @@ zg --version
 | `-j N` | 线程数（默认按实际收益决定，最多每个 CPU 一个，见[工作原理](#工作原理)；内存上限不够时也会减少） |
 | `--io=` | 读文件方式：`auto`（默认，搜索过程中实测选择）、`mmap` 或 `pread` |
 | `--mem=SIZE` | zg 自己分配内存的上限，例如 `512M`、`4G`（默认：系统当前不换页就能给出的内存，最多物理内存的一半） |
+| `-F`、`-a` | 接受但忽略：zg 始终按字节搜索字面量 |
 | `--version`、`-V` | 版本、构建目标；可移植的 x86-64 构建还会显示在本机运行的级别（`running v3`） |
 
 退出码：有匹配为 0，没有匹配为 1，出错为 2。输出端提前关闭时（`| head`）安静退出。与 ripgrep 的一处差异：`-c` 没有匹配时输出 `0`（与 grep 相同），ripgrep 什么都不输出。
+
+**标准输入**（以及其他不是普通文件的输入：管道、`<(命令)`、`/dev/stdin`、读的时候由系统生成内容的文件，比如 `/proc` 下的）会先整个读进内存，上限是物理内存的一半（`--mem=SIZE` 可以改），然后再搜索：输入结束之前不会输出任何东西，所以 `tail -f log | zg ERROR` 什么也看不到，几十 GB 的管道输入则需要先存成文件。把普通文件作为标准输入（`zg ERROR < app.log`）则直接在原文件上搜索，从头开始，和文件参数一样。
+
+**错误**是标准错误上的一行，有系统通用说法的用系统的说法（`zg: app.log: No such file or directory`），退出码 2。zg 不支持的功能（正则表达式、`-i`、`-v`、`-o`、上下文行、多个文件或目录）会明确说明：`zg: option '-i' is not supported: zg searches for a case-sensitive literal in one file or standard input`。
+
+**搜索过程中文件被截断**（别的进程把它变短）会以 `zg: app.log: the file changed while it was being searched` 结束，退出码 2，进程不会被 SIGBUS 杀死（macOS 上 zg 用的私有映射仍显示旧内容，搜索会正常结束）。
 
 ## 构建
 
@@ -96,7 +105,7 @@ pub fn main(init: std.process.Init) !void {
 - `zg.Options`：
   - 搜索内容和输出：`pattern`、`line_numbers`、`count_only`、`max_matches`；
   - 资源：`threads`（共享引擎上表示这次搜索最多用几个线程）、`io`、`memory_limit`（只用于一次性引擎）；
-  - 中止：`cancel`、`timeout_ns`，见下一条。
+  - 中止：`cancel`、`timeout_ns`，见下一条；`truncation_guard`（一次性引擎）让搜索期间被截断的文件以 `error.FileChanged` 结束，而不是被 SIGBUS 杀死进程。
 - 中止搜索：
   - 取消：设置 `cancel = &c`，其中 `c` 是一个 `zg.Cancel`，其它线程可以调用 `c.request()`，搜索随即以 `error.Canceled` 结束；
   - 超时：设置 `timeout_ns`，超时返回 `error.Timeout`；
@@ -125,7 +134,7 @@ pub const std_options: std.Options = .{ .signal_stack_size = null };
 - **跨搜索保留**（256MB 以下的文件）：文件的映射（已缺页填好的页面）和每个模式在它上面调好的过滤器。文件变化（大小或修改时间）后会重新映射、重新调参。在 Ryzen 上，8MB 缓存文件的小搜索从 0.6ms 降到 0.1ms；有输出大量行的大搜索同时在跑时，小搜索的 p99 从 11ms 降到 4ms。
 - **每个搜索的线程数按收益决定**，与一次性搜索相同（见下文）。
 - 大搜索留下的缓冲区由空闲的池线程释放，而不是由恰好最后结束的那个搜索来做。
-- **文件被截断**：映射期间文件变短会触发 SIGBUS（Linux 上会，测试中会在搜索进行时截断文件来验证；macOS 上 zg 用的私有映射仍显示旧内容）。信号处理器会把它转成对应搜索的 `error.FileChanged`，进程不会崩溃。不是 zg 映射引起的 SIGBUS，交还给原来的处理器。
+- **文件被截断**：映射期间文件变短会触发 SIGBUS（Linux 上会，测试中会在搜索进行时截断文件来验证；macOS 上 zg 用的私有映射仍显示旧内容）。信号处理器会把它转成对应搜索的 `error.FileChanged`，进程不会崩溃。不是 zg 映射引起的 SIGBUS，交还给原来的处理器。一次性搜索通过 `Options.truncation_guard` 获得同样的保护（命令行工具已打开）；那里默认关闭，因为信号处理器是进程级的。
 
 ## 工作原理
 

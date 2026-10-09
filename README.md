@@ -25,9 +25,12 @@ case folding, no directory walking.
 ## Command line
 
 ```
-zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN FILE
+zg [-n] [-c] [-m N] [-j N] [--io=auto|mmap|pread] [--mem=SIZE] [--] PATTERN [FILE]
 zg --version
 ```
+
+Without `FILE`, or with `-`, zg searches standard input: `some-command | zg ERROR`. Short options
+can be put together and take their value attached: `-nc`, `-m5`, `-nm 5`.
 
 | option | |
 |---|---|
@@ -37,11 +40,30 @@ zg --version
 | `-j N` | threads (default: as many as pay off, up to one per CPU; see [Threads](#how-it-works)) |
 | `--io=` | how to read the file: `auto` (default, measured while searching), `mmap` or `pread` |
 | `--mem=SIZE` | cap on the memory zg allocates, e.g. `512M`, `4G` (default: what the system can hand out without swapping, at most half of the physical memory) |
+| `-F`, `-a` | accepted and ignored: zg always searches for a literal, in bytes |
 | `--version`, `-V` | the version, the target, and for a portable x86-64 build the level it runs on this CPU (`running v3`) |
 
 Exit status: 0 if a line matched, 1 if none did, 2 on errors. A closed output (`| head`)
 ends the search quietly. One difference from ripgrep: `-c` with no match prints `0` (as
 grep does), where ripgrep prints nothing.
+
+**Standard input** (and any other file that is not a regular one: a pipe, `<(command)`,
+`/dev/stdin`, files the system makes up as they are read, like those in `/proc`) is read into
+memory first, up to half of the physical memory (`--mem=SIZE` changes it), and then searched:
+nothing is printed before the input ends, so `tail -f log | zg ERROR` shows nothing, and a pipe
+of tens of gigabytes needs a file instead. A regular file given as standard input
+(`zg ERROR < app.log`) is searched in place, from its beginning, like a file argument.
+
+**Errors** are one line on standard error, with the system's wording where there is one
+(`zg: app.log: No such file or directory`), and status 2. What zg does not do (regular
+expressions, `-i`, `-v`, `-o`, context lines, several files or a directory) is named as such:
+`zg: option '-i' is not supported: zg searches for a case-sensitive literal in one file or
+standard input`.
+
+**A file that shrinks during the search** (another process truncates it) ends the search with
+`zg: app.log: the file changed while it was being searched` and status 2, instead of the process
+being killed by SIGBUS (on macOS zg's private mapping keeps showing the old contents, and the
+search finishes).
 
 ## Building
 
@@ -120,7 +142,8 @@ pub fn main(init: std.process.Init) !void {
   `on_line(ctx, line_number, line)` for each matching line, in order, e.g. to build JSON.
 - `zg.Options`: `pattern`, `line_numbers`, `count_only`, `max_matches`, `threads` (on a
   shared engine: the most threads this search may use), `io`, `memory_limit` (one-shot
-  engines), `cancel`, `timeout_ns`.
+  engines), `cancel`, `timeout_ns`, `truncation_guard` (one-shot engines: a file truncated
+  during the search ends it with `error.FileChanged` instead of killing the process with SIGBUS).
 - Stopping a search: `cancel = &c` with a `zg.Cancel` that another thread can `request()`
   (the search then fails with `error.Canceled`), or `timeout_ns` (`error.Timeout`). A
   writer that fails (a client that went away, or a writer that enforces a size cap) stops
@@ -170,7 +193,9 @@ What the shared engine adds over running one-shot searches side by side:
   tests truncate files under running searches; on macOS zg's private mapping keeps showing
   the old contents). A handler turns that into
   `error.FileChanged` for the search concerned instead of a crash; other SIGBUS go to the
-  handler that was there before.
+  handler that was there before. One-shot searches have the same with
+  `Options.truncation_guard` (the command line tool sets it); it is off by default there
+  because the handler is process-wide.
 
 ## How it works
 

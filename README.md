@@ -300,20 +300,40 @@ a lot (see bench/results.md).
 #### Performance CI
 
 To measure a change, merge it into the `perf` branch: pushing or merging into `perf` runs
-[`.github/workflows/bench.yml`](.github/workflows/bench.yml), which runs `.github/bench.sh` on
-Linux x86-64, Linux aarch64 and macOS (Apple Silicon). It reports zg against ripgrep (the 39
-standard cases and the small-file and `-m` cases) and the new state of `perf` against the one
-before the push, both builds alternating on the same machine so that the noise of a shared runner
-affects them alike. The report is in the job summary and the artifacts. The run fails when the
-geometric mean over the 39 cases is more than 15 % slower than before (identical builds differ by
-1 to 2 % there); read single cases as indications only. Runs of consecutive pushes queue instead
-of replacing each other. It also runs weekly on `main`, and by hand with `base_ref` (any branch,
-tag or commit to compare with), `runs` and `threshold`. The same on your machine:
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml): one job per platform below, which
+runs `.github/bench.sh` for each CPU level of the platform one after the other on the same machine
+(`.github/bench-variants.sh`: a hosted runner is a different CPU model from one job to the next, so
+only levels measured in the same job can be compared), and ends with one report of all of them (job
+summary, and the artifact `bench-summary` with `summary.md` and `results.csv`, every row of every
+timing table).
+
+| platform | CPU levels |
+|---|---|
+| Linux x86-64 | native (the runner's CPU); v1 (SSE2), v2 (SSE4.2, POPCNT) and v3 (AVX2, BMI2, FMA), the three cores of the portable build run in turn; v4 (AVX-512), a build for x86-64-v4, where the runner's CPU has it |
+| Linux arm64 | native (the runner's CPU); baseline (ARMv8-A with NEON, which zg uses on every arm64 CPU) |
+| macOS arm64 (Apple Silicon) | native (Zig's baseline for macOS arm64 is the M1, the same build) |
+
+Each run measures zg against ripgrep on the 39 standard cases and the 54 stress cases (common
+bytes, long patterns, very long and very short lines, random bytes), on all cores and on one thread,
+small files and `-m`; the native run of each platform also the peak memory, and on Linux the first
+read from disk (not on macOS: the runner has too little disk for the copies that takes). It also
+compares the new state of `perf` with the one before the push,
+both builds alternating on the same machine so that the noise of a shared runner affects them
+alike, and fails when the geometric mean over the 39 cases is more than 15 % slower (identical
+builds differ by 1 to 2 % there); read single cases as indications only. Runs of consecutive
+pushes queue instead of replacing each other. It also runs weekly on `main` (against ripgrep
+only), and by hand with `base_ref` (any branch, tag or commit to compare with), `runs` and
+`threshold`. zg has no AVX-512 or SVE code of its own: the v4 and native rows show what letting the
+compiler use those instructions does. The same on your machine:
 
 ```
 zig build
 .github/bench.sh                          # against ripgrep
 .github/bench.sh --base ./zg-old --fail-regression 10   # also against another build
+.github/bench.sh --sections warm,single,worst,small,mem,cold   # everything the CI runs, and more
+zig build -Dcpu=baseline --prefix p && .github/bench.sh --bin p/bin --level v1   # one CPU level
+.github/bench-variants.sh x86 --out reports   # every level of a platform, one report each
+python3 .github/summarize.py report1.md report2.md > summary.md   # merge reports
 ```
 
 ## Limitations and roadmap

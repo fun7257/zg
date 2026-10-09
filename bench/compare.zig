@@ -1,13 +1,14 @@
 //! Compares zg with ripgrep by running both as child processes:
 //!   zig build compare -- --dir DIR [--zg PATH] [--rg PATH] [--runs N]
-//!       [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT]
+//!       [--sections ab,warm,single,worst,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT]
 //!       [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify]
 //!       [--fail-regression PERCENT]
 //! DIR must hold the corpora written by `zig build gen`. `--case` replaces the default
 //! cases; the `ab` section alternates runs of `--zg` and `--zg-b` (on `--threads` threads)
 //! instead of comparing with ripgrep, and ends with the geometric mean over its cells;
 //! `--fail-regression PERCENT` makes `compare` exit with an error when B is slower than A by
-//! more than that on that mean. The `small` section times its own cases (small files,
+//! more than that on that mean. The `worst` section times the stress cases (`worst_cases`:
+//! common bytes, long patterns, the stress corpora) on all cores and on one thread. The `small` section times its own cases (small files,
 //! `-m`), where fixed costs weigh, with the CPU time of both tools.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -29,6 +30,29 @@ const default_cases = [_]Case{
     .{ .file = "log.txt", .pattern = "[auth]" },
     .{ .file = "log.txt", .pattern = "req=0000" },
     .{ .file = "log.txt", .pattern = "/api/v2/items/" },
+};
+
+/// Single spaces and common letters, 40- and 200-byte patterns, the file of 20 to 600 KB lines
+/// (long.txt), the file of 0 to 3 character lines (short.txt) and random binary data.
+const worst_cases = [_]Case{
+    .{ .file = "words.txt", .pattern = " " },
+    .{ .file = "words.txt", .pattern = "e " },
+    .{ .file = "words.txt", .pattern = "e t" },
+    .{ .file = "words.txt", .pattern = "the " },
+    .{ .file = "words.txt", .pattern = "ing the" },
+    .{ .file = "words.txt", .pattern = " a " },
+    .{ .file = "words.txt", .pattern = "tion" },
+    .{ .file = "words.txt", .pattern = "gumian leinger exfo thespl ri thecon it " },
+    .{ .file = "long.txt", .pattern = " " },
+    .{ .file = "long.txt", .pattern = "th" },
+    .{ .file = "long.txt", .pattern = "needle_zz" },
+    .{ .file = "long.txt", .pattern = " t glmelczooi bdoadseo zre tetaa roimom mseenmsssptbvtvbeos p jrrz qdkovcsdc   sfspdtef seaapasct phmtaaga s iibzocmvatt atc bi  ipvtc afsctvjvstmuebneogi aeansp btipes e eooa o idws t aeimwpsn gow pn" },
+    .{ .file = "short.txt", .pattern = "a" },
+    .{ .file = "short.txt", .pattern = "ab c" },
+    .{ .file = "short.txt", .pattern = "needle_zz" },
+    .{ .file = "random.bin", .pattern = "ab" },
+    .{ .file = "random.bin", .pattern = "abc" },
+    .{ .file = "random.bin", .pattern = "needle_zz" },
 };
 
 /// Cases in use: `default_cases`, or the ones given with `--case FILE:PATTERN`.
@@ -229,7 +253,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (extra_cases.items.len != 0) cases = extra_cases.items;
     if (cfg.dir.len == 0) {
-        std.debug.print("usage: compare --dir DIR [--zg PATH] [--rg PATH] [--runs N] [--sections ab,warm,single,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT] [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify] [--fail-regression PERCENT]\n", .{});
+        std.debug.print("usage: compare --dir DIR [--zg PATH] [--rg PATH] [--runs N] [--sections ab,warm,single,worst,small,mem,cold] [--case FILE:PATTERN]... [--filter TEXT] [--outputs lines,-n,-c] [--zg-b PATH] [--threads N] [--no-verify] [--fail-regression PERCENT]\n", .{});
         return error.BadArgument;
     }
     const c: Ctx = .{ .io = io, .gpa = gpa, .cfg = cfg };
@@ -239,6 +263,14 @@ pub fn main(init: std.process.Init) !void {
     if (has(cfg.sections, "ab")) try compareBuilds(c);
     if (has(cfg.sections, "warm")) try timing(c, "Warm cache, all cores", 0);
     if (has(cfg.sections, "single")) try timing(c, "Warm cache, one thread (-j 1 for both)", 1);
+    if (has(cfg.sections, "worst")) {
+        const standard = cases;
+        cases = &worst_cases;
+        defer cases = standard;
+        if (cfg.verify) try verify(c);
+        try timing(c, "Worst cases, all cores", 0);
+        try timing(c, "Worst cases, one thread (-j 1 for both)", 1);
+    }
     if (has(cfg.sections, "small")) try small(c);
     if (has(cfg.sections, "mem")) try memory(c);
     if (has(cfg.sections, "cold")) try cold(c);

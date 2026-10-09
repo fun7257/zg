@@ -1,0 +1,91 @@
+name: Release
+
+# On a tag `vX.Y.Z` (X.Y.Z as in build.zig.zon): builds zg for each system, tests the binaries
+# as they will be shipped, and publishes them as a GitHub release with SHA256SUMS. On a pull
+# request that changes this workflow, the packaging, or build.zig it does everything but publish.
+#
+# Linux and macOS binaries are built and tested on a runner of their own kind. The x86-64 one is
+# the portable build (`-Dcpu=baseline`: cores for x86-64 v1, v2 and v3, chosen at start-up); the
+# arm64 ones are for generic ARMv8-A, not for the runner's CPU (a build for a Neoverse N2 would
+# use SVE2 and fail on older CPUs).
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/package.sh
+      - .github/release-notes.md
+      - build.zig
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64-linux
+            os: ubuntu-latest
+            levels: v1 v2 v3
+          - name: aarch64-linux
+            os: ubuntu-24.04-arm
+            levels: ""
+          - name: aarch64-macos
+            os: macos-latest
+            levels: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build, test and pack
+        env:
+          NAME: ${{ matrix.name }}
+          LEVELS: ${{ matrix.levels }}
+        run: .github/package.sh "$NAME" -Dcpu=baseline
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zg-${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: zg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz | tee SHA256SUMS
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          sed "s/VERSION/${TAG#v}/g" .github/release-notes.md > notes.md
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --title "zg ${TAG#v}" --notes-file notes.md --generate-notes --verify-tag

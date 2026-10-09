@@ -4,3 +4,4 @@ zig-out/
 portable/
 bench-corpus
 bench.md
+dist

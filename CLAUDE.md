@@ -15,7 +15,7 @@ it works; this file is what is not obvious from the code.
   `stress` (shared engine under concurrency). `bench/results.md` (Apple Silicon) and
   `bench/results-x86-linux.md` (Ryzen) hold the measurements behind the numbers in the README.
 - `.github/`: `workflows/ci.yml` (tests), `workflows/bench.yml` (performance), `smoke.sh` (output
-  against `grep -F`), `cli-tests.sh` (standard input, error messages, options, truncation), `bench.sh` (one benchmark run; works by hand too), `bench-variants.sh` (every CPU level of
+  against `grep -F`), `cli-tests.sh` (standard input, error messages, options, truncation), `bench.sh` (one benchmark run; works by hand too), `package.sh` (build, test and pack a release binary), `bench-variants.sh` (every CPU level of
   a platform, one run each), `summarize.py` (merges the reports).
 
 ## Build and test
@@ -104,6 +104,24 @@ change against the base, a few cases side by side, the machines; plus `results.c
 - zg has no AVX-512 or SVE code. Some hosted x86-64 runners have AVX-512 (EPYC 9V74, Xeon 8573C;
   not the EPYC 7763), and the arm64 runner is a Neoverse N2 (SVE2): that is where such a kernel could
   be checked.
+
+## Releasing
+
+A release is a tag `vX.Y.Z` on `main`, where `X.Y.Z` is the `.version` in `build.zig.zon` (the
+workflow refuses a tag that differs, and so does `zg --version`). To cut one:
+
+1. Raise `.version` in `build.zig.zon` in a pull request, and merge it.
+2. Tag the merge commit and push the tag: `git tag -a vX.Y.Z -m "zg X.Y.Z" && git push origin vX.Y.Z`.
+3. `release.yml` builds, tests and packs each system on a runner of its own kind
+   (`.github/package.sh`), then publishes the release: `zg-X.Y.Z-SYSTEM.tar.gz` for x86_64-linux
+   (portable build, cores for v1, v2, v3), aarch64-linux and aarch64-macos, with `SHA256SUMS` and
+   the text of `.github/release-notes.md` plus the list of merged pull requests.
+
+Releases are stripped (`-Dstrip=true`), and the arm64 ones are generic ARMv8-A (`-Dcpu=baseline`),
+never built for the runner's CPU (a Neoverse N2 build uses SVE2). Check the numbers quoted in
+`release-notes.md` against `bench/results*.md` before a release. A pull request that changes the
+workflow, `package.sh` or `build.zig` runs everything but the publishing. Not built: Windows, and
+macOS on Intel.
 
 ## Conventions
 

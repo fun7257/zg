@@ -65,6 +65,20 @@ standard input`.
 being killed by SIGBUS (on macOS zg's private mapping keeps showing the old contents, and the
 search finishes).
 
+## Install
+
+Binaries are on the [releases page](https://github.com/fun7257/zg/releases): Linux x86-64 (one
+static binary with cores for SSE2, SSE4.2 and AVX2, chosen when it starts), Linux arm64, and macOS
+on Apple Silicon. Download, check against `SHA256SUMS`, unpack, and put `zg` on your `PATH`:
+
+```
+tar xzf zg-0.1.0-x86_64-linux.tar.gz
+install zg-0.1.0-x86_64-linux/zg ~/.local/bin/
+```
+
+The macOS binary is not notarized: if macOS refuses to open one downloaded with a browser, run
+`xattr -d com.apple.quarantine zg` once. To build it yourself, see below.
+
 ## Building
 
 Requires [Zig 0.16.0](https://ziglang.org/download/).

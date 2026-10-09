@@ -4,11 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)") orelse .ReleaseFast;
 
+    // Debug information is left out of the binaries of a release (`-Dstrip`): 4.8 MB to about 0.4.
+    const strip = b.option(bool, "strip", "Leave debug information out of zg (default: no)") orelse false;
+
     // The library, for other packages: `b.dependency("zg", .{}).module("zg")`.
     const zg_mod = b.addModule("zg", .{
         .root_source_file = b.path("src/zg.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (strip) true else null,
     });
 
     // The command line tool. Built for an x86-64 CPU without AVX2 (as for distribution), it
@@ -25,6 +29,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (strip) true else null,
         .imports = &.{
             .{ .name = "zg", .module = zg_mod },
             .{ .name = "build_options", .module = build_options.createModule() },
@@ -46,6 +51,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = root,
                 .target = b.resolveTargetQuery(query),
                 .optimize = optimize,
+                .strip = if (strip) true else null,
             }));
         }
     }

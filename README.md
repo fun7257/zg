@@ -299,15 +299,16 @@ a lot (see bench/results.md).
 
 #### Performance CI
 
-[`.github/workflows/bench.yml`](.github/workflows/bench.yml) runs `.github/bench.sh` on Linux
-x86-64, Linux aarch64 and macOS (Apple Silicon): zg against ripgrep (the 39 standard cases and
-the small-file and `-m` cases), and on pull requests that touch `src/`, `bench/` or
-`build.zig`, the change against its base, both builds alternating on the same machine so that the
-noise of a shared runner affects them alike. The report is in the job summary and the
-artifacts. The check fails when the geometric mean over the 39 cases is more than 15 % slower
-than the base (identical builds differ by about 1 % here); read single cases as indications
-only. It also runs weekly on `main`, and by hand with `base_ref` (any branch, tag or commit to
-compare with), `runs` and `threshold`. The same on your machine:
+To measure a change, merge it into the `perf` branch: pushing or merging into `perf` runs
+[`.github/workflows/bench.yml`](.github/workflows/bench.yml), which runs `.github/bench.sh` on
+Linux x86-64, Linux aarch64 and macOS (Apple Silicon). It reports zg against ripgrep (the 39
+standard cases and the small-file and `-m` cases) and the new state of `perf` against the one
+before the push, both builds alternating on the same machine so that the noise of a shared runner
+affects them alike. The report is in the job summary and the artifacts. The run fails when the
+geometric mean over the 39 cases is more than 15 % slower than before (identical builds differ by
+1 to 2 % there); read single cases as indications only. Runs of consecutive pushes queue instead
+of replacing each other. It also runs weekly on `main`, and by hand with `base_ref` (any branch,
+tag or commit to compare with), `runs` and `threshold`. The same on your machine:
 
 ```
 zig build

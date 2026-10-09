@@ -1,19 +1,17 @@
 name: Performance
 
-# zg against ripgrep on each platform, and on pull requests the change against its base: both
-# builds run alternately on the same machine, so the noise of a shared runner affects them
-# alike. The report is in the job summary and, as a file, in the artifacts. A pull request
-# fails when the geometric mean over the cases is more than `threshold` percent slower than
-# the base. Runners are shared machines: read single cases as indications, the mean as the result.
+# Runs when something is pushed or merged into the `perf` branch: to measure a change, merge it
+# into `perf`. zg against ripgrep on each platform, and the new state of the branch against its
+# previous one (the commit `perf` pointed to before the push): both builds run alternately on the
+# same machine, so the noise of a shared runner affects them alike. The report is in the job
+# summary and, as a file, in the artifacts. The run fails when the geometric mean over the cases
+# is more than `threshold` percent slower than the previous state. Runners are shared machines:
+# read single cases as indications, the mean as the result. Also weekly on the default branch
+# (against ripgrep only), and by hand with a ref to compare with.
 
 on:
-  pull_request:
-    paths:
-      - src/**
-      - bench/**
-      - build.zig
-      - .github/bench.sh
-      - .github/workflows/bench.yml
+  push:
+    branches: [perf]
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -34,9 +32,11 @@ on:
 permissions:
   contents: read
 
+# A push to `perf` waits for the run before it (each one is a measurement worth keeping);
+# the others replace a run in progress.
 concurrency:
   group: bench-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   RUNS: ${{ inputs.runs || '11' }}
@@ -78,14 +78,19 @@ jobs:
       - name: Build
         run: zig build
 
-      # What to compare with: the base of a pull request, or the ref asked for by hand.
+      # What to compare with: where `perf` was before this push, or the ref asked for by hand.
       - name: Build the base
         id: base
         env:
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
           BASE_REF: ${{ inputs.base_ref }}
         run: |
-          ref="${PR_BASE:-$BASE_REF}"
+          ref="${BASE_REF:-$BEFORE}"
+          case "$ref" in 0*[!0]*) ;; 0*) ref="" ;; esac # a new branch: all zeros
+          if [ -n "$ref" ] && ! git cat-file -e "$ref^{commit}" 2>/dev/null; then
+            echo "$ref is not in the history (a forced push?)."
+            ref=""
+          fi
           if [ -z "$ref" ]; then
             echo "No base: zg against ripgrep only."
             exit 0

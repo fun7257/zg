@@ -14,7 +14,8 @@ it works; this file is what is not obvious from the code.
   `stress` (shared engine under concurrency). `bench/results.md` (Apple Silicon) and
   `bench/results-x86-linux.md` (Ryzen) hold the measurements behind the numbers in the README.
 - `.github/`: `workflows/ci.yml` (tests), `workflows/bench.yml` (performance), `smoke.sh` (output
-  against `grep -F`), `bench.sh` (what the performance workflow runs; works by hand too).
+  against `grep -F`), `bench.sh` (one benchmark run; works by hand too), `summarize.py` (merges
+  the reports of several runs).
 
 ## Build and test
 
@@ -73,13 +74,23 @@ on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t
 ## Performance workflow
 
 To measure a change in CI, **merge it into the `perf` branch** (create it from `main` if it does not
-exist). A push or merge into `perf` runs `bench.yml` on the three platforms: zg against ripgrep, and
-the new state of `perf` against the one before the push, alternating. It fails when the geometric
-mean over the 39 standard cases is more than 15 % slower. Pull requests do not trigger it. By hand:
-the `Performance` workflow with `base_ref` (any ref to compare with).
+exist). A push or merge into `perf` runs `bench.yml`: `.github/bench.sh` on nine platform and CPU
+level combinations, then `Report` merges them (`.github/summarize.py`: headline table, CPU time,
+change against the base, a few cases side by side, the machines; plus `results.csv`).
 
-The hosted runners have an AMD EPYC (Zen 4: AVX-512) and a Neoverse N2 (SVE2) that no local machine
-has; that is where an AVX-512 or SVE kernel could be checked.
+- Linux x86-64: native; v1, v2, v3 (the portable build's three cores, run in turn with
+  `ZG_CPU_LEVEL`); v4 (`-Dcpu=x86_64_v4`, only where the runner's CPU has AVX-512).
+- Linux arm64: native; baseline. macOS arm64: native; baseline.
+- Each measures zg against rg (39 standard cases, 54 stress cases, all cores and one thread, small
+  files and `-m`; the native runs also memory, and on Linux the cold read), and the new `perf`
+  against the one before the push, alternating. It fails when the geometric mean over the 39 cases
+  is more than 15 % slower. Pull requests do not trigger it. By hand: the `Performance` workflow with
+  `base_ref` (any ref to compare with).
+- Adding a platform or a level is a matrix entry in `bench.yml` (`id`, `name`, `os`, `flags`,
+  `level`, `sections`). `summarize.py` reads `compare`'s text (the `## ` headings and the
+  `speedup over N cells` lines): change them together. `compare` has a built-in `worst` section.
+- zg has no AVX-512 or SVE code. The hosted runners have an AMD EPYC (Zen 4: AVX-512) and a
+  Neoverse N2 (SVE2), so that is where such a kernel could be checked.
 
 ## Conventions
 

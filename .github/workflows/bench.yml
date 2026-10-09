@@ -1,13 +1,22 @@
 name: Performance
 
 # Runs when something is pushed or merged into the `perf` branch: to measure a change, merge it
-# into `perf`. zg against ripgrep on each platform, and the new state of the branch against its
-# previous one (the commit `perf` pointed to before the push): both builds run alternately on the
-# same machine, so the noise of a shared runner affects them alike. The report is in the job
-# summary and, as a file, in the artifacts. The run fails when the geometric mean over the cases
-# is more than `threshold` percent slower than the previous state. Runners are shared machines:
-# read single cases as indications, the mean as the result. Also weekly on the default branch
-# (against ripgrep only), and by hand with a ref to compare with.
+# into `perf`. Every platform and CPU level in the matrix below runs the whole benchmark
+# (.github/bench.sh): zg against ripgrep on the 39 standard cases and the 54 stress cases, on all
+# cores and on one thread, small files and `-m`, and on the first of each platform the peak memory
+# and the first read from disk; and the new state of the branch against the one before the push,
+# both builds alternating on the same machine so that the noise of a shared runner affects them
+# alike. The last job merges the reports into one (job summary and artifact `bench-summary`). A
+# job fails when the geometric mean over the 39 cases is more than `threshold` percent slower than
+# the previous state. Runners are shared machines: read single cases as indications, the mean as
+# the result. Also weekly on the default branch (against ripgrep only), and by hand with a ref to
+# compare with.
+#
+# CPU levels. x86-64: the portable build (`-Dcpu=baseline`) carries cores for v1 (SSE2), v2
+# (SSE4.2, POPCNT) and v3 (AVX2, BMI2, FMA) and runs each of them in turn (ZG_CPU_LEVEL); v4
+# (AVX-512) is a build for x86-64-v4, run where the runner's CPU has AVX-512; "native" is the
+# build for the runner's own CPU. arm64: native (the runner's CPU) and baseline (ARMv8-A with
+# NEON, which zg uses on every arm64 CPU).
 
 on:
   push:
@@ -23,7 +32,7 @@ on:
       runs:
         description: "Runs per case"
         required: false
-        default: "11"
+        default: "9"
       threshold:
         description: "Fail when slower than the base by more than this many percent (0: never)"
         required: false
@@ -39,24 +48,75 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
-  RUNS: ${{ inputs.runs || '11' }}
+  RUNS: ${{ inputs.runs || '9' }}
   THRESHOLD: ${{ inputs.threshold || '15' }}
 
 jobs:
   bench:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: Linux x86-64
+          # Linux x86-64
+          - id: x86-native
+            name: Linux x86-64, native
             os: ubuntu-latest
-          - name: Linux aarch64
+            flags: ""
+            level: ""
+            sections: warm,single,worst,small,mem,cold
+          - id: x86-v1
+            name: Linux x86-64, v1 (SSE2)
+            os: ubuntu-latest
+            flags: -Dcpu=baseline
+            level: v1
+            sections: warm,single,worst,small
+          - id: x86-v2
+            name: Linux x86-64, v2 (SSE4.2, POPCNT)
+            os: ubuntu-latest
+            flags: -Dcpu=baseline
+            level: v2
+            sections: warm,single,worst,small
+          - id: x86-v3
+            name: Linux x86-64, v3 (AVX2, BMI2, FMA)
+            os: ubuntu-latest
+            flags: -Dcpu=baseline
+            level: v3
+            sections: warm,single,worst,small
+          - id: x86-v4
+            name: Linux x86-64, v4 (AVX-512)
+            os: ubuntu-latest
+            flags: -Dcpu=x86_64_v4
+            level: ""
+            sections: warm,single,worst,small
+          # Linux arm64
+          - id: arm-native
+            name: Linux arm64, native
             os: ubuntu-24.04-arm
-          - name: macOS aarch64
+            flags: ""
+            level: ""
+            sections: warm,single,worst,small,mem,cold
+          - id: arm-baseline
+            name: Linux arm64, baseline (ARMv8-A, NEON)
+            os: ubuntu-24.04-arm
+            flags: -Dcpu=baseline
+            level: ""
+            sections: warm,single,worst,small
+          # macOS arm64 (a cold read needs the disk cache emptied, and the runner has little disk)
+          - id: mac-native
+            name: macOS arm64, native
             os: macos-latest
+            flags: ""
+            level: ""
+            sections: warm,single,worst,small,mem
+          - id: mac-baseline
+            name: macOS arm64, baseline (ARMv8-A, NEON)
+            os: macos-latest
+            flags: -Dcpu=baseline
+            level: ""
+            sections: warm,single,worst,small
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,7 +126,22 @@ jobs:
         with:
           version: 0.16.0
 
+      # The AVX-512 build only runs where the CPU has it.
+      - name: Check the CPU
+        id: cpu
+        env:
+          ID: ${{ matrix.id }}
+        run: |
+          ok=true
+          if [ "$ID" = x86-v4 ]; then
+            for f in avx512f avx512bw avx512cd avx512dq avx512vl; do
+              grep -qw "$f" /proc/cpuinfo || ok=false
+            done
+          fi
+          echo "ok=$ok" >> "$GITHUB_OUTPUT"
+
       - name: Install ripgrep
+        if: steps.cpu.outputs.ok == 'true'
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
             brew install ripgrep
@@ -76,14 +151,20 @@ jobs:
           fi
 
       - name: Build
-        run: zig build
+        if: steps.cpu.outputs.ok == 'true'
+        env:
+          FLAGS: ${{ matrix.flags }}
+        run: zig build $FLAGS
 
-      # What to compare with: where `perf` was before this push, or the ref asked for by hand.
+      # What to compare with: where `perf` was before this push, or the ref asked for by hand;
+      # built the same way as the build under test.
       - name: Build the base
         id: base
+        if: steps.cpu.outputs.ok == 'true'
         env:
           BEFORE: ${{ github.event.before }}
           BASE_REF: ${{ inputs.base_ref }}
+          FLAGS: ${{ matrix.flags }}
         run: |
           ref="${BASE_REF:-$BEFORE}"
           case "$ref" in 0*[!0]*) ;; 0*) ref="" ;; esac # a new branch: all zeros
@@ -96,20 +177,27 @@ jobs:
             exit 0
           fi
           git worktree add "$RUNNER_TEMP/base" "$ref"
-          (cd "$RUNNER_TEMP/base" && zig build)
+          (cd "$RUNNER_TEMP/base" && zig build $FLAGS)
           cp "$RUNNER_TEMP/base/zig-out/bin/zg" "$RUNNER_TEMP/zg-base"
           echo "binary=$RUNNER_TEMP/zg-base" >> "$GITHUB_OUTPUT"
 
       - name: Benchmark
+        if: steps.cpu.outputs.ok == 'true'
         shell: bash
         env:
           BASE_BINARY: ${{ steps.base.outputs.binary }}
+          LABEL: ${{ matrix.name }}
+          SECTIONS: ${{ matrix.sections }}
+          LEVEL: ${{ matrix.level }}
         run: |
-          args=(--runs "$RUNS")
+          args=(--runs "$RUNS" --sections "$SECTIONS" --label "$LABEL")
+          if [ -n "$LEVEL" ]; then
+            args+=(--level "$LEVEL")
+          fi
           if [ -n "$BASE_BINARY" ]; then
             args+=(--base "$BASE_BINARY" --fail-regression "$THRESHOLD")
           fi
-          echo "## ${{ matrix.name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## $LABEL" >> "$GITHUB_STEP_SUMMARY"
           set +e
           .github/bench.sh "${args[@]}" > bench.md
           status=$?
@@ -118,8 +206,41 @@ jobs:
           cat bench.md
           exit $status
 
+      - name: Note the skipped run
+        if: steps.cpu.outputs.ok != 'true'
+        env:
+          LABEL: ${{ matrix.name }}
+        run: |
+          printf '# zg performance\n\n```\nlabel:    %s\nskipped:  this runner has no AVX-512\n```\n' "$LABEL" | tee bench.md >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: bench-${{ runner.os }}-${{ runner.arch }}
+          name: bench-${{ matrix.id }}
           path: bench.md
+
+  # One report of all of them: the headline numbers per platform and CPU level, the change
+  # against the base, a few cases side by side, the machines; and every row as CSV.
+  report:
+    name: Report
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: reports
+
+      - name: Merge the reports
+        run: |
+          mkdir summary
+          python3 .github/summarize.py reports/*/bench.md --csv summary/results.csv > summary/summary.md
+          cat summary/summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-summary
+          path: summary

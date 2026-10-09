@@ -30,11 +30,12 @@ const usage =
     \\  -m N     stop after N matching lines
     \\  -j N     number of threads (default: as many as pay off, up to all cores)
     \\  --io=M   how to read the file: auto (default), mmap or pread
-    \\  --mem=S  cap on the memory zg allocates, e.g. 512M or 4G (default: what the
-    \\           system can give without swapping, at most half of RAM)
+    \\  --mem=S  cap on the memory zg allocates, e.g. 64M or 1G (default: a few times
+    \\           what the threads need, about 150 MB on 16 threads; below that, searches
+    \\           that print much are slower)
     \\  -F, -a   accepted and ignored (zg searches for a literal in bytes)
     \\  Standard input that is a pipe (and any other file that is not a regular one) is
-    \\  read into memory first, up to the limit of --mem; a regular file given as standard
+    \\  read into memory first, up to half of the memory (or --mem); a regular file given as standard
     \\  input (zg PATTERN < file) is searched in place, from its beginning.
     \\  Exit status: 0 if a line matched, 1 if none did, 2 on errors.
     \\
@@ -242,8 +243,8 @@ fn run(comptime Zg: type, init: std.process.Init, level: ?Level) !void {
         std.process.exit(0);
     }
 
-    // Standard input is held in memory up to the memory limit of --mem, by default half of
-    // the physical memory.
+    // Standard input is held in memory up to --mem if given, else half of the physical
+    // memory: it is the input, not the working memory the default limit is sized for.
     const cap = if (cli.opts.memory_limit != 0) cli.opts.memory_limit else (std.process.totalSystemMemory() catch 2 << 30) / 2;
     var name: []const u8 = undefined;
     const source = openInput(Zg, init, cli.path, cap, &name);

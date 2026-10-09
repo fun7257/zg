@@ -17,9 +17,10 @@ pub const Options = struct {
     /// Bytes per chunk; 0 derives it from the file size and thread count. Tests set tiny
     /// values to exercise the chunk boundary logic.
     chunk_size: usize = 0,
-    /// Cap in bytes on the memory zg allocates (0: what the system can hand out right now,
-    /// but never more than half of the physical memory). Two thirds of it is the accounted
-    /// budget, see "Memory budget" below.
+    /// Cap in bytes on the memory zg allocates (0: sized by the threads and the chunks, a few
+    /// times what the threads need: about 150 MB on 16 threads of a core with 512 KB of L2, at
+    /// least 32 MB, and never more than the system has; see `defaultMemoryLimit`). Two thirds of
+    /// it is the accounted budget, see "Memory budget" below.
     memory_limit: usize = 0,
     /// Lets another thread stop the search (`Cancel.request`); it then fails with
     /// `error.Canceled`.
@@ -94,14 +95,16 @@ pub const Cancel = struct {
 // Line length costs no memory: a line that runs past the chunk it starts in is written
 // straight from the mapping by the writer (see "Chunks" below).
 //
-// The limit is `memory_limit`; by default the memory the system can hand out without
-// swapping (free and reclaimable pages, `availableMemory`), capped at half of the physical
-// memory: the cap is a ceiling, not something to fill when the machine is busy. The accounted
-// budget is two thirds of it, the rest covers what the accounting cannot see. Each thread
-// also carries a fixed overhead while it works on output, so unless `-j` is given the
-// thread count shrinks to what the limit can carry (`threadsFor`). Measured with `a` over
-// a 539 MB file (5.95 million matching lines) and a stalled reader, the peak footprint then
-// stayed below the limit for limits from 32 MB to 1 GB, with and without `-n`.
+// The limit is `memory_limit`; by default a few times what the threads need
+// (`defaultMemoryLimit`), the least that costs no speed: more memory did not make zg faster,
+// and a reader that stalls is held back by the limit, not by the machine running out (a
+// container with a memory limit of its own was killed before). The accounted budget is two
+// thirds of it, the rest covers what the accounting cannot see. Each thread also carries an
+// overhead of a few chunks while it works on output (`memoryPerThread`), so unless `-j` is
+// given the thread count shrinks to what the limit can carry (`threadsFor`). Measured with `a`
+// over a 539 MB file (5.95 million matching lines) and a stalled reader, the peak footprint
+// then stayed below the limit for limits from 32 MB to 1 GB, with and without `-n`; with
+// the default, 110 MB however much is printed (588 MB for 400 MB of output before).
 
 // Chunks
 //
@@ -1371,13 +1374,27 @@ fn chooseIo(mapped: []align(std.heap.page_size_min) u8) IoMode {
     return if (resident * 100 >= samples * span * mmap_resident_percent) .mmap else .pread;
 }
 
-/// Default memory limit: what can be allocated now without pushing the system into swap,
-/// and never more than half of the physical memory.
-fn defaultMemoryLimit(io: Io) usize {
+/// Default memory limit: what the `threads` need (`per_thread` each) times
+/// `default_limit_factor`, at least `min_default_limit`; and never more than what can be
+/// allocated now without pushing the system into swap, nor than half of the physical memory.
+fn defaultMemoryLimit(io: Io, threads: usize, per_thread: usize) usize {
+    const wanted = @max(min_default_limit, threads * per_thread * default_limit_factor);
     const half = (std.process.totalSystemMemory() catch 2 << 30) / 2;
-    const available = availableMemory(io) orelse return half;
-    return @intCast(@min(half, available));
+    const available = availableMemory(io) orelse return @min(half, wanted);
+    return @intCast(@min(@min(half, available), wanted));
 }
+
+/// The default limit is `default_limit_factor` times what the threads need (`memoryPerThread`),
+/// at least `min_default_limit`: more memory than that did not make zg faster. Cases of the
+/// standard set that print millions of lines to /dev/null (16 threads, 3 MB each, Zen 3; time at
+/// the limit against the time with the whole of the memory): 32 MB, up to 22 % slower; 64 MB,
+/// up to 7 %; 128 MB, none. The factor 3 puts the default (144 MB there) at twice the point
+/// where nothing is lost. The count mode needs a tenth (the floor applies). The limit used to
+/// be what the system could hand out, at most half of the physical memory: gigabytes, which
+/// only a reader slower than the search ever used, and which a container with a memory limit
+/// of its own (the system does not tell zg) could not give.
+const default_limit_factor = 3;
+const min_default_limit = 32 << 20;
 
 /// Memory the system can hand out right now without swapping: free pages plus pages it
 /// reclaims cheaply (clean page cache, speculative and purgeable pages). Null if unknown.
@@ -1432,7 +1449,33 @@ test "availableMemory is plausible" {
     if (availableMemory(testing.io)) |a| {
         try testing.expect(a > 0 and a <= total);
     }
-    try testing.expect(defaultMemoryLimit(testing.io) <= total / 2);
+    try testing.expect(defaultMemoryLimit(testing.io, 16, memoryPerThread(testing.io, .{ .pattern = "x" })) <= total / 2);
+}
+
+test "the default memory limit follows the threads and the chunk size, not the machine's memory" {
+    const mib = 1 << 20;
+    const total = (std.process.totalSystemMemory() catch 2 << 30) / 2;
+    const per_thread = memoryPerThread(testing.io, .{ .pattern = "x" });
+    // The floor, for few threads.
+    try testing.expect(defaultMemoryLimit(testing.io, 1, per_thread) >= @min(min_default_limit, total));
+    // Threads times what each needs, times the factor, as far as the machine has the memory.
+    const want = 16 * per_thread * default_limit_factor;
+    try testing.expect(defaultMemoryLimit(testing.io, 16, per_thread) <= @max(want, min_default_limit));
+    if (want <= total and want < 8 * 1024 * mib) {
+        const got = defaultMemoryLimit(testing.io, 16, per_thread);
+        try testing.expect(got <= want);
+        // availableMemory may be lower on a busy machine, but never lower than the floor's order.
+        try testing.expect(got >= @min(want, 16 * mib));
+    }
+    // Counting needs less per thread than rendering.
+    try testing.expect(defaultMemoryLimit(testing.io, 16, memoryPerThread(testing.io, .{ .pattern = "x", .count_only = true })) <= defaultMemoryLimit(testing.io, 16, per_thread));
+    // A search with the default limit gives the reference output.
+    const gpa = testing.allocator;
+    const data = try genText(gpa, 32, 3000, "abc ", 0, true);
+    defer gpa.free(data);
+    for ([_]bool{ false, true }) |numbered| {
+        try expectMatchesReference(data, .{ .pattern = "ab", .line_numbers = numbered, .chunk_size = 256 });
+    }
 }
 
 /// Bytes of the file's beginning used to choose the filter of a weak pattern.
@@ -1456,12 +1499,25 @@ fn tunedSearcher(io: Io, pattern: []const u8, mapped: []const u8, io_mode: IoMod
     return s;
 }
 
-/// Memory each thread needs on top of the accounted budget. Measured with a stalled reader
-/// (peak footprint beyond the budget, per thread): about 8 MB when the thread renders
-/// output, with or without line numbers, of which three times is reserved; counting only
-/// needs the thread's own working set.
-fn memoryPerThread(opts: Options) usize {
-    return if (opts.count_only) 4 << 20 else 24 << 20;
+/// Chunks are at least this many bytes, whatever the memory limit.
+const min_chunk = 256 * 1024;
+
+/// The largest a chunk gets: a thread's share of the L2 cache, at most 2 MB (`l2PerThread`).
+fn chunkCeiling(io: Io) usize {
+    return @max(min_chunk, @min(l2PerThread(io), 2 * 1024 * 1024));
+}
+
+/// Memory each thread needs on top of the accounted budget, in chunks: measured with a
+/// stalled reader (peak footprint beyond the budget, per thread) it is about 4 chunks when
+/// the thread renders output, with or without line numbers (a chunk's output buffer, its
+/// matches, its `pread` buffer), of which three times is reserved; counting only needs the
+/// thread's own working set, about a chunk, of which twice is reserved. With the 2 MB chunks
+/// of the Mac that is 24 MB and 4 MB (as it was, as a constant, before chunks followed the
+/// cache); with the 256 KB chunks of a Zen 3 core, 3 MB and 512 KB, and 16 threads then
+/// allocated 12 to 30 MB in all (`--io=pread`, measured), not the 384 MB the old constant
+/// reserved.
+fn memoryPerThread(io: Io, opts: Options) usize {
+    return chunkCeiling(io) * @as(usize, if (opts.count_only) 2 else 12);
 }
 
 const max_threads = 1024;
@@ -1771,8 +1827,10 @@ const Pool = struct {
     }
 
     fn create(io: Io, gpa: std.mem.Allocator, config: Config) !*Pool {
-        const limit = if (config.memory_limit != 0) config.memory_limit else defaultMemoryLimit(io);
-        const n = threadsFor(config.threads, std.Thread.getCpuCount() catch 1, limit, memoryPerThread(.{ .pattern = "" }));
+        const cpus = std.Thread.getCpuCount() catch 1;
+        const wanted_threads = if (config.threads != 0) config.threads else cpus;
+        const limit = if (config.memory_limit != 0) config.memory_limit else defaultMemoryLimit(io, wanted_threads, memoryPerThread(io, .{ .pattern = "" }));
+        const n = threadsFor(config.threads, cpus, limit, memoryPerThread(io, .{ .pattern = "" }));
         BusGuard.install();
         const p = try gpa.create(Pool);
         errdefer gpa.destroy(p);
@@ -2187,9 +2245,11 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     var own_bufs: Buffers = .{};
     const limit: usize, const ncpu: usize, const mem: *Memory = switch (kind) {
         .oneshot => blk: {
-            const limit = if (opts.memory_limit != 0) opts.memory_limit else defaultMemoryLimit(io);
+            const cpus = std.Thread.getCpuCount() catch 1;
+            const wanted_threads = if (opts.threads != 0) opts.threads else cpus;
+            const limit = if (opts.memory_limit != 0) opts.memory_limit else defaultMemoryLimit(io, wanted_threads, memoryPerThread(io, opts));
             own_mem = .{ .budget = limit / 3 * 2 };
-            break :blk .{ limit, threadsFor(opts.threads, std.Thread.getCpuCount() catch 1, limit, memoryPerThread(opts)), &own_mem };
+            break :blk .{ limit, threadsFor(opts.threads, cpus, limit, memoryPerThread(io, opts)), &own_mem };
         },
         .shared => .{ pool.limit, pool.threads.len + 1, &pool.mem },
     };
@@ -2197,9 +2257,7 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     // Small chunks balance load across heterogeneous cores; they stay < 4 GiB for u32
     // offsets. Every thread works on one chunk at a time, so with a small memory limit the
     // chunks shrink too (but not below `min_chunk`, where per-chunk overhead starts to show).
-    const min_chunk = 256 * 1024;
-    // At most a thread's share of the L2 cache (`l2PerThread`), and at most 2 MB.
-    const max_chunk = @max(min_chunk, @min(l2PerThread(io), 2 * 1024 * 1024, limit / (ncpu * 16)));
+    const max_chunk = @max(min_chunk, @min(chunkCeiling(io), limit / (ncpu * 16)));
     const chunk_size = if (opts.chunk_size != 0) opts.chunk_size else std.math.clamp(size / (ncpu * 16), min_chunk, max_chunk);
     const nchunks = (size + chunk_size - 1) / chunk_size;
 
@@ -3000,10 +3058,13 @@ test "a match only deep inside a line that spans many chunks" {
 
 test "threadsFor shrinks the thread count to fit the memory limit" {
     const mib = 1 << 20;
-    const rendering = memoryPerThread(.{ .pattern = "x" });
-    const counting = memoryPerThread(.{ .pattern = "x", .count_only = true });
-    try testing.expectEqual(rendering, memoryPerThread(.{ .pattern = "x", .line_numbers = true }));
-    try testing.expect(counting < rendering);
+    // What a thread needs follows the chunk size; the arithmetic below is for the 2 MB chunks of
+    // a core with a large L2.
+    const rendering = 24 * mib;
+    const counting = 4 * mib;
+    try testing.expectEqual(memoryPerThread(testing.io, .{ .pattern = "x" }), memoryPerThread(testing.io, .{ .pattern = "x", .line_numbers = true }));
+    try testing.expect(memoryPerThread(testing.io, .{ .pattern = "x", .count_only = true }) < memoryPerThread(testing.io, .{ .pattern = "x" }));
+    try testing.expectEqual(12 * chunkCeiling(testing.io), memoryPerThread(testing.io, .{ .pattern = "x" }));
 
     // Plenty of memory: one thread per CPU, whatever the mode.
     for ([_]usize{ rendering, counting }) |per_thread| {

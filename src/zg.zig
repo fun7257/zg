@@ -593,6 +593,9 @@ const Job = struct {
     file: ?Io.File,
     searcher: search.Searcher,
     chunk_size: usize,
+    /// Bytes of chunk 0: shorter than the others on a search that times its first chunk
+    /// (`Ramp.probe`), so that the thread count can be decided sooner; the others follow.
+    first_len: usize,
     nchunks: usize,
     line_numbers: bool,
     count_only: bool,
@@ -659,6 +662,8 @@ const Job = struct {
     work_ns: std.atomic.Value(u64) = .init(0),
     /// Time chunks of any access method took, waiting for the writer excluded (for `Ramp`).
     chunk_ns: std.atomic.Value(u64) = .init(0),
+    /// Bytes those chunks covered.
+    chunk_bytes: std.atomic.Value(u64) = .init(0),
     /// When the first thread `Ramp` started finished its first chunk (`awake` clock, ns; 0 until
     /// then): how long starting a thread took in this search, on this machine, under this load.
     helper_done: std.atomic.Value(u64) = .init(0),
@@ -868,13 +873,25 @@ const Job = struct {
         return first;
     }
 
+    /// Time a byte took, from the chunks done (for `Ramp`).
+    fn nsPerByte(job: *const Job) f64 {
+        const bytes = job.chunk_bytes.load(.monotonic);
+        if (bytes == 0) return 0;
+        return @as(f64, @floatFromInt(job.chunk_ns.load(.monotonic))) / @as(f64, @floatFromInt(bytes));
+    }
+
+    /// First byte of chunk `i`.
+    fn chunkLo(job: *const Job, i: usize) usize {
+        return if (i == 0) 0 else job.first_len + (i - 1) * job.chunk_size;
+    }
+
     /// Processes chunk `i`: see "Chunks" at the top of the file.
     fn doChunk(job: *Job, i: usize, sc: *Scratch) !void {
         const res = &job.results[i];
         const size = job.data.len;
         const m = job.searcher.needle.len;
-        const lo = i * job.chunk_size;
-        const hi = @min(lo + job.chunk_size, size);
+        const lo = job.chunkLo(i);
+        const hi = @min(lo + (if (i == 0) job.first_len else job.chunk_size), size);
         // Match starts in [lo, hi) need the bytes up to hi + m - 1; the byte before lo tells
         // whether lo starts a line.
         const v_lo = if (i == 0) 0 else lo - 1;
@@ -896,7 +913,10 @@ const Job = struct {
         defer {
             const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Timestamp.now(job.std_io, .awake)).nanoseconds));
             job.access.record(&sc.streak, access, ns -| sc.waited, hi - lo);
-            if (job.ramp != null) _ = job.chunk_ns.fetchAdd(ns -| sc.waited, .monotonic);
+            if (job.ramp != null) {
+                _ = job.chunk_ns.fetchAdd(ns -| sc.waited, .monotonic);
+                _ = job.chunk_bytes.fetchAdd(hi - lo, .monotonic);
+            }
             if (access == .read and job.ramp != null) {
                 _ = job.read_ns.fetchAdd(read_ns, .monotonic);
                 _ = job.work_ns.fetchAdd(ns -| sc.waited -| read_ns, .monotonic);
@@ -1081,7 +1101,7 @@ const Job = struct {
         var pos = try job.writePiece(out, job.results[i].tail, pd.start, pd.start, e);
         var k = i + 1;
         while (k <= last and k < job.nchunks) : (k += 1) {
-            pos = try job.writePiece(out, job.results[k].cont, k * job.chunk_size, pos, e);
+            pos = try job.writePiece(out, job.results[k].cont, job.chunkLo(k), pos, e);
         }
         if (pos < e) try job.writeRange(out, pos, e);
         try out.writeByte('\n');
@@ -2271,7 +2291,8 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     // chunks shrink too (but not below `min_chunk`, where per-chunk overhead starts to show).
     const max_chunk = @max(min_chunk, @min(chunkCeiling(io), limit / (ncpu * 16)));
     const chunk_size = if (opts.chunk_size != 0) opts.chunk_size else std.math.clamp(size / (ncpu * 16), min_chunk, max_chunk);
-    const nchunks = (size + chunk_size - 1) / chunk_size;
+    const first_len = firstChunkLen(chunk_size, size, calib != null);
+    const nchunks = chunkCount(size, first_len, chunk_size);
 
     const results = try gpa.alloc(ChunkResult, nchunks);
     defer gpa.free(results);
@@ -2325,6 +2346,7 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
             break :blk tuned;
         } else tunedSearcher(io, opts.pattern, mapped, io_mode, file),
         .chunk_size = chunk_size,
+        .first_len = first_len,
         .nchunks = nchunks,
         .line_numbers = opts.line_numbers and !opts.count_only,
         .count_only = opts.count_only,
@@ -2477,6 +2499,26 @@ fn runStreaming(job: *Job, ramp: *Ramp, w: *Io.Writer) !void {
 /// the costs times `start_cost_upper` allow, which can only start too few; the first thread
 /// started then times its own start, and `learn` starts the rest from that.
 const start_cost_upper = 3.0;
+
+/// Set by tests to cut the first chunk to that many bytes whatever the search.
+var test_first_len: usize = 0;
+
+/// Bytes of the first chunk. A search that times it to decide its thread count (`Ramp.probe`)
+/// cuts it to a quarter of a chunk, at a page boundary, so that the decision does not wait for a
+/// whole chunk: on the arm64 runner a 1 MB chunk takes 0.3 to 0.4 ms, 20 times what starting a
+/// thread takes the caller, and the threads started only after it were 7 to 12 % behind
+/// threads started at once. The others are `chunk_size` each, from where it ends.
+fn firstChunkLen(chunk_size: usize, size: usize, probing: bool) usize {
+    if (test_first_len != 0) return @min(test_first_len, size);
+    const page = std.heap.pageSize();
+    if (!probing or chunk_size < 4 * page or size <= chunk_size) return chunk_size;
+    return @max(page, chunk_size / 4 / page * page);
+}
+
+fn chunkCount(size: usize, first_len: usize, chunk_size: usize) usize {
+    if (size <= first_len) return 1;
+    return 1 + (size - first_len + chunk_size - 1) / chunk_size;
+}
 
 /// The thread count that finishes `work_ns` (the rest of a search on one thread) soonest, the
 /// caller included; one if no more threads win. A thread asked for now does its first chunk
@@ -2723,8 +2765,8 @@ const Ramp = struct {
                     r.state = .done;
                     return;
                 }
-                const per_chunk = job.chunk_ns.load(.monotonic) / done;
-                const w = per_chunk * (job.nchunks - next);
+                const rate = job.nsPerByte();
+                const w: u64 = @intFromFloat(rate * @as(f64, @floatFromInt(job.data.len - job.chunkLo(next))));
                 const latency = c.latencyNs(r.chunk_bytes);
                 const spawn = 2 * c.spawn_ns;
                 // Not even the measured costs, a lower bound, make threads pay: one thread.
@@ -2753,9 +2795,11 @@ const Ramp = struct {
                 // start now if the real costs say they pay; none is stopped.
                 const hd = job.helper_done.load(.acquire);
                 if (hd == 0) return;
-                const per_chunk = job.chunk_ns.load(.monotonic) / @max(done, 1);
+                const rate = job.nsPerByte();
+                const per_chunk: u64 = @intFromFloat(rate * @as(f64, @floatFromInt(job.chunk_size)));
                 const latency = hd -| r.spawn_ns -| per_chunk;
-                const want = threadsForWork(per_chunk * (job.nchunks - next), latency, 2 * r.spawn_cost_ns, r.cores, 1.0);
+                const rest: u64 = @intFromFloat(rate * @as(f64, @floatFromInt(job.data.len - job.chunkLo(@min(next, job.nchunks - 1)))));
+                const want = threadsForWork(rest, latency, 2 * r.spawn_cost_ns, r.cores, 1.0);
                 if (want > r.active) r.spawnUpTo(job, want);
                 if (r.active < r.cores) {
                     r.state = .done;
@@ -3041,6 +3085,40 @@ test "output matches the reference for every io mode, thread count and chunk siz
             }
         };
     }
+}
+
+test "a first chunk of any length gives the reference output" {
+    const gpa = testing.allocator;
+    defer test_first_len = 0;
+    const data = try genText(gpa, 5, 150, "abc ", 700, false); // lines far longer than a chunk, no final newline
+    defer gpa.free(data);
+    const text = try genText(gpa, 6, 90, "qzxj_ ", 0, true);
+    defer gpa.free(text);
+    for ([_]usize{ 1, 3, 50, 63, 64, 65, 200, 1000, 100_000 }) |first| {
+        test_first_len = first;
+        for (all_io) |io_choice| for ([_]usize{ 1, 3 }) |threads| for ([_]usize{ 64, 200, 4096 }) |chunk| {
+            for ([_][]const u8{ "a", "abc", "c a", "b b c", "zzzzzz" }) |pat| {
+                for ([_][2]bool{ .{ false, false }, .{ true, false }, .{ false, true } }) |flags| {
+                    try expectMatchesReference(data, .{ .pattern = pat, .line_numbers = flags[0], .count_only = flags[1], .io = io_choice, .threads = threads, .chunk_size = chunk });
+                }
+            }
+            try expectMatchesReference(text, .{ .pattern = "xj_", .line_numbers = true, .io = io_choice, .threads = threads, .chunk_size = chunk });
+        };
+    }
+}
+
+test "chunk bounds: the first chunk is cut to a page-aligned quarter, the others follow it" {
+    const page = std.heap.pageSize();
+    try testing.expectEqual(@as(usize, 256 * 1024), firstChunkLen(1 << 20, 64 << 20, true));
+    try testing.expectEqual(@as(usize, 1 << 20), firstChunkLen(1 << 20, 64 << 20, false));
+    try testing.expectEqual(@as(usize, 64 * 1024), firstChunkLen(256 * 1024, 64 << 20, true));
+    try testing.expectEqual(@as(usize, 256 * 1024), firstChunkLen(256 * 1024, 200 * 1024, true)); // one chunk or less
+    try testing.expectEqual(@as(usize, 2 * page), firstChunkLen(8 * page, 1 << 30, true));
+    try testing.expectEqual(@as(usize, 1), chunkCount(100, 100, 256));
+    try testing.expectEqual(@as(usize, 2), chunkCount(101, 100, 256));
+    try testing.expectEqual(@as(usize, 2), chunkCount(356, 100, 256));
+    try testing.expectEqual(@as(usize, 3), chunkCount(357, 100, 256));
+    try testing.expectEqual(@as(usize, 1), chunkCount(10, 100, 256));
 }
 
 test "threads started as the search goes (no thread count given)" {

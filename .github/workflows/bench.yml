@@ -99,9 +99,17 @@ jobs:
         run: |
           ref="${BASE_REF:-$BEFORE}"
           case "$ref" in 0*[!0]*) ;; 0*) ref="" ;; esac # a new branch: all zeros
-          if [ -n "$ref" ] && ! git cat-file -e "$ref^{commit}" 2>/dev/null; then
-            echo "$ref is not in the history (a forced push?)."
-            ref=""
+          # A commit, a tag, or a branch: the checkout has the branches only as origin/NAME.
+          if [ -n "$ref" ]; then
+            found=""
+            for candidate in "$ref" "origin/$ref"; do
+              if found=$(git rev-parse --verify --quiet "$candidate^{commit}"); then break; fi
+              found=""
+            done
+            if [ -z "$found" ]; then
+              echo "$ref is not a commit, tag or branch of this repository (or a forced push removed it)."
+            fi
+            ref="$found"
           fi
           [ -z "$ref" ] && echo "No base: zg against ripgrep only."
           echo "ref=$ref" >> "$GITHUB_OUTPUT"

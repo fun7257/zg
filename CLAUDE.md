@@ -54,6 +54,14 @@ on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t
   searches). Without it a file truncated during an `mmap` search kills the process.
 - **Root files set `std_options.signal_stack_size = null`** outside Debug (main, bench, stress):
   the default 256 KB signal stack per thread made a thread start ~7x slower (130 vs 17 us).
+- **Memory is small on purpose.** More memory does not make zg faster: its speed is the file in the
+  page cache, which the system keeps. The default limit is `threads * memoryPerThread * 3` (at
+  least 32 MB), about 150 MB on 16 threads; each thread reserves 12 chunks while it renders output
+  (2 while counting), and chunks are at most a thread's share of L2, so the numbers follow the CPU.
+  Below roughly 40 % of that default, searches that print millions of lines get slower, because
+  `threadsFor` allows fewer threads; to move the numbers, sweep `--mem` over the standard cases that
+  print much (`the`, `-n a`, short.txt `a`) and watch the time and, with `--io=pread`, the peak RSS.
+  Do not tie the default to the machine's memory: a container does not tell (it was killed).
 - **Vector width** is 16 bytes without AVX2 (SSE2, NEON), 32 with: 32 on SSE2 was twice as slow.
 - **Linux specifics**, each measured (see results-x86-linux.md): `pread` from page boundaries (a
   copy offset by a byte is 3-6x slower); chunk size is at most a thread's share of L2, read from

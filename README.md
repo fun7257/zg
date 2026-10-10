@@ -39,7 +39,7 @@ can be put together and take their value attached: `-nc`, `-m5`, `-nm 5`.
 | `-m N` | stop after N matching lines |
 | `-j N` | threads (default: as many as pay off, up to one per CPU; see [Threads](#how-it-works)) |
 | `--io=` | how to read the file: `auto` (default, measured while searching), `mmap` or `pread` |
-| `--mem=SIZE` | cap on the memory zg allocates, e.g. `512M`, `4G` (default: what the system can hand out without swapping, at most half of the physical memory) |
+| `--mem=SIZE` | cap on the memory zg allocates, e.g. `64M`, `1G` (default: a few times what the threads need, about 150 MB on 16 threads, at least 32 MB; below that, searches that print much get slower) |
 | `-F`, `-a` | accepted and ignored: zg always searches for a literal, in bytes |
 | `--version`, `-V` | the version, the target, and for a portable x86-64 build the level it runs on this CPU (`running v3`) |
 
@@ -251,9 +251,16 @@ What the shared engine adds over running one-shot searches side by side:
   rare pattern in a cached 540 MB file takes 24.3 ms on 8 threads and 26.4 ms on 16 on an
   8-core Ryzen, while printing 4.7 M lines takes 41.1 and 32.6 ms. A share of 0.75 or more
   already over the first chunks decides at once.
-- **Memory**: a cap (see `--mem`), two thirds of it as the budget for buffered output.
-  Beyond it, threads stop taking new chunks until the writer catches up (the chunks right
-  behind the writer always go on), and drained buffers are freed rather than kept.
+- **Memory**: a cap (see `--mem`), two thirds of it as the budget for buffered output. The
+  default is a few times what the threads need (each reserves a dozen chunks while it renders
+  output): about 150 MB on 16 threads with 256 KB chunks, and it is what a search uses at most,
+  however much it prints and however slowly the output is read (400 MB of output to a reader
+  that waits: 110 MB, where the limit used to be half of the memory and the use 588 MB).
+  Memory beyond that did not make zg faster (the standard cases that print millions of lines
+  run as fast at 128 MB as with all the memory; at 64 MB up to 7 % slower, at 32 MB up to 22 %).
+  Beyond the cap, threads stop taking new chunks until the writer catches up (the chunks right
+  behind the writer always go on), and drained buffers are freed rather than kept. The fast
+  part of zg is the file in the page cache, which the system keeps and zg does not count.
 
 ## Performance
 

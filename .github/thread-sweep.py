@@ -11,9 +11,10 @@ threads just before every run) and "cold" (0.3 s idle before every run). In each
 
   A. what starting a thread costs (`bench --start-cost`, 40 samples);
   B. the gain of 2, 3 or 4 threads over one on files of 4 to 32 MB, observed against what
-     the model predicts with the measured costs times 2.5 (`start_cost_factor`), and the
-     costs fitted to the observations (the ratio of the fitted costs to the measured is where
-     the 2.5 comes from);
+     the model predicts with the measured costs times kappa, and the kappa that makes the
+     prediction closest to the observations (`start_cost_upper` in src/zg.zig is the factor
+     the first decision may not exceed; the costs measured on a lone thread are lower bounds,
+     kappa >= 1, and how far above depends on the machine);
   C. wall and CPU time of one thread, of the default, and of all threads at once, by size.
 
 Every setting of a round runs once, in an order that rotates from round to round.
@@ -29,7 +30,7 @@ import tempfile
 import time
 
 KB, MB = 1024, 1024 * 1024
-START_COST_FACTOR = 2.5
+START_COST_UPPER = 3.0
 WORKLOADS = {"-c needle_zz": ["-c", "needle_zz"], "-c the": ["-c", "the"], "the (lines)": ["the"]}
 FIT_ROWS = ("-c the", "the (lines)")  # the others saturate the memory bandwidth first
 
@@ -139,23 +140,20 @@ class Harness:
         return {k: (statistics.median(wall[k]), statistics.mean(cpu[k])) for k in labels}
 
 
-def fit_costs(rows):
-    """Least squares for L and s in  W*(j-1)/j - gain = (j-1)/j * (L + s*(1 + j/2)).
-    rows: (W, j, gain). Returns L, s, rms (ms), or None."""
-    a = [(((j - 1) / j), ((j - 1) / j) * (1 + j / 2)) for _, j, _ in rows]
-    y = [((j - 1) / j) * w - g for w, j, g in rows]
-    a11 = sum(p * p for p, _ in a)
-    a12 = sum(p * q for p, q in a)
-    a22 = sum(q * q for _, q in a)
-    b1 = sum(p * v for (p, _), v in zip(a, y))
-    b2 = sum(q * v for (_, q), v in zip(a, y))
-    det = a11 * a22 - a12 * a12
-    if abs(det) < 1e-12:
-        return None
-    l = (b1 * a22 - b2 * a12) / det
-    s = (a11 * b2 - a12 * b1) / det
-    rms = math.sqrt(sum((p * l + q * s - v) ** 2 for (p, q), v in zip(a, y)) / len(a))
-    return l, s, rms
+def best_kappa(rows, l, s):
+    """The factor on the measured costs that gets the predicted gains closest (rms, ms) to the
+    observed ones: rows are (W, j, gain). Returns kappa, rms."""
+    best = None
+    for k10 in range(0, 81):
+        k = k10 / 10
+        rms = rms_error(rows, l, s, k)
+        if best is None or rms < best[1]:
+            best = (k, rms)
+    return best
+
+
+def rms_error(rows, l, s, k):
+    return math.sqrt(sum((predicted_gain(w, j, k * l, k * s) - g) ** 2 for w, j, g in rows) / len(rows))
 
 
 def predicted_gain(w, j, l, s):
@@ -191,7 +189,7 @@ def main():
           f"So L = {l_meas:.3f} ms and s (spawn and join) = {s_meas:.3f} ms.\n")
 
         # B: gains of j threads over one
-        p("### Gain of j threads over one thread (ms), observed / predicted\n")
+        p(f"### Gain of j threads over one thread (ms), observed / predicted with the measured costs times {START_COST_UPPER}\n")
         sizes_b = ["4M", "8M", "16M", "32M"]
         T = {}
         for name in ["128K"] + sizes_b:
@@ -206,7 +204,7 @@ def main():
                 cells = []
                 for j in js[1:]:
                     obs = t1 - T[(name, wl)][j][0]
-                    pred = predicted_gain(w, j, START_COST_FACTOR * l_meas, START_COST_FACTOR * s_meas)
+                    pred = predicted_gain(w, j, START_COST_UPPER * l_meas, START_COST_UPPER * s_meas)
                     cells.append(f"{obs:.2f} / {pred:.2f}")
                     if wl in FIT_ROWS:
                         rows_fit.append((w, j, obs))
@@ -216,17 +214,14 @@ def main():
         for name, wl, w, cells in table:
             p(f"| {name} | {wl} | {w:.2f} | " + " | ".join(cells) + " |")
         p("")
-        fit = fit_costs(rows_fit) if len({j for _, j, _ in rows_fit}) >= 2 else None
-        if fit:
-            l_fit, s_fit, rms = fit
-            errs = [abs(g - predicted_gain(w, j, START_COST_FACTOR * l_meas, START_COST_FACTOR * s_meas))
-                    for w, j, g in rows_fit]
-            p(f"Fitted to the observed gains of `-c the` and `the (lines)`: L = {l_fit:.3f} ms, s = {s_fit:.3f} ms "
-              f"(rms {rms:.3f} ms). Against the measured: L {l_fit / l_meas:.1f}x, s {s_fit / s_meas:.1f}x "
-              f"(`start_cost_factor` is {START_COST_FACTOR}). With the measured costs times {START_COST_FACTOR} "
-              f"the mean error of the predicted gain on those rows is {statistics.mean(errs):.3f} ms.\n")
+        if rows_fit:
+            k, rms = best_kappa(rows_fit, l_meas, s_meas)
+            p(f"Kappa that fits the observed gains of `-c the` and `the (lines)` best: {k:.1f} "
+              f"(rms {rms:.2f} ms). Error of the predicted gain with the measured costs as they are "
+              f"(kappa 1): {rms_error(rows_fit, l_meas, s_meas, 1.0):.2f} ms; with kappa {START_COST_UPPER}: "
+              f"{rms_error(rows_fit, l_meas, s_meas, START_COST_UPPER):.2f} ms.\n")
         else:
-            p("Too few CPUs to fit L and s (needs gains for two thread counts above one).\n")
+            p("No rows to fit.\n")
 
         # C: one thread, the default, all threads at once
         p("### Wall ms (CPU ms) by size: one thread, the default, all threads at once\n")

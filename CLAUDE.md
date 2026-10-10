@@ -74,17 +74,20 @@ argument") and every run aborts.
   set its directory in `build.zig`: use `--prefix-exe-dir PATH`.
 - **Thread count comes from measured costs, not a file size** (`StartCost`, `threadsForWork`, `Ramp`
   in `zg.zig`). A thread started with the search times starting a thread; after the first chunk the
-  caller picks the n of the least T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n. The costs are not
-  constants: a thread starts 70 to 320 us after the cores were idle and 22 to 73 us when they were
-  busy, so a threshold fitted on back-to-back benchmark runs is wrong for an interactive run.
-  `start_cost_factor` (2.5) is the fitted-over-measured ratio: the lone thread measures a lower
-  bound. To check or retune: run fixed `-j 1/2/4/8` in a warm (just after a 16-thread run) and a
-  cold (0.3 s idle) state, fit L and s to the observed gains (see `bench/results-x86-linux.md`) and
-  compare with the measurements. The model ignores memory bandwidth (more than about 4 threads do
-  not help a 10 GB/s-per-thread scan) and the writer. Shared engines and `-m` do not use it.
-  **Measure such things with the builds alternating in rotating order, never one setting after
-  another**: a first table (each thread count in a block of its own) was wrong because the clock
-  rate followed the order of the blocks.
+  caller picks the n of the least T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, in two steps: the
+  measured costs are a lower bound whose distance from the truth depends on the machine (the
+  factor that fits was 2.5 to 2.9 on x86-64 runners and the Ryzen, 0.6 to 0.9 on arm64), so the
+  first step starts threads only if the measured costs say they pay, and no more than the costs
+  times `start_cost_upper` allow (it can only start too few); the first thread started times its
+  own first chunk and `.learn` starts the rest from that. The costs are not constants: a thread
+  starts 70 to 320 us after the cores were idle and 22 to 73 us when they were busy, so a
+  threshold fitted on back-to-back benchmark runs is wrong for an interactive run. To check or
+  retune: the Performance workflow (`only_threads`) runs `.github/thread-sweep.py` on the
+  three platforms; it reports the kappa that fits each. The model ignores memory bandwidth (more
+  than about 4 threads do not help a 10 GB/s-per-thread scan) and the writer. Shared engines and
+  `-m` do not use it. **Measure such things with the builds alternating in rotating order, never
+  one setting after another**: a first table (each thread count in a block of its own) was wrong
+  because the clock rate followed the order of the blocks.
 - **Vector width** is 16 bytes without AVX2 (SSE2, NEON), 32 with: 32 on SSE2 was twice as slow.
 - **Linux specifics**, each measured (see results-x86-linux.md): `pread` from page boundaries (a
   copy offset by a byte is 3-6x slower); chunk size is at most a thread's share of L2, read from

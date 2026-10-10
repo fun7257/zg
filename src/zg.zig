@@ -659,6 +659,9 @@ const Job = struct {
     work_ns: std.atomic.Value(u64) = .init(0),
     /// Time chunks of any access method took, waiting for the writer excluded (for `Ramp`).
     chunk_ns: std.atomic.Value(u64) = .init(0),
+    /// When the first thread `Ramp` started finished its first chunk (`awake` clock, ns; 0 until
+    /// then): how long starting a thread took in this search, on this machine, under this load.
+    helper_done: std.atomic.Value(u64) = .init(0),
 
     fn takeBuffer(job: *Job) std.ArrayList(u8) {
         job.bufs.acquire(job.std_io);
@@ -794,11 +797,9 @@ const Job = struct {
     fn rampWorker(job: *Job) void {
         var sc: Scratch = .{};
         defer sc.deinit(job.gpa);
+        if (!job.workOne(&sc, true)) return;
+        _ = job.helper_done.cmpxchgStrong(0, nowNs(job.std_io), .release, .monotonic);
         while (job.workOne(&sc, true)) {}
-    }
-
-    fn nowNs(job: *const Job) u64 {
-        return @intCast(@max(0, Io.Timestamp.now(job.std_io, .awake).nanoseconds));
     }
 
     /// Claims and processes the next chunk of the current phase; false when none is left.
@@ -2466,25 +2467,28 @@ fn runStreaming(job: *Job, ramp: *Ramp, w: *Io.Writer) !void {
 ///     -c needle_zz 24.3 / 26.4   ERROR 21.2 / 24.5   long.txt th 23.2 / 42.3
 ///     the 41.1 / 32.6            -n a 67.3 / 47.8    -c the 30.4 / 25.4
 ///
-/// The costs measured on a lone thread are lower bounds of what the helpers of a search pay:
-/// they also contend for the kernel's locks while they get their buffers, find the file cold
-/// in their caches, and are joined at the end. Fitting the model below to the gains observed
-/// with 2 and 4 threads gave a latency 2.6 times and a per-thread cost 1.9 to 3.3 times the
-/// measured ones, warm and cold alike (L 0.31 against 0.12 ms and s 0.134 against 0.041 ms
-/// warm; 0.94 against 0.36 and 0.20 against 0.105 cold).
-const start_cost_factor = 2.5;
+/// The costs measured on a lone thread (`StartCost`) are lower bounds of what the helpers of a
+/// search pay: they also contend for the kernel's locks while they get their buffers, find the
+/// file cold in their caches, and are joined at the end. How far below depends on the machine:
+/// the factor that makes the model below follow the observed gains of 2 and 4 threads was
+/// 2.8 to 2.9 on x86-64 (Ryzen 7735U 2.5, a hosted EPYC or Xeon 2.8 and 2.9, warm and cold) and
+/// 0.6 to 0.9 on a hosted Neoverse N2 (arm64). So the first decision uses the two bounds: it
+/// starts threads if the measured costs themselves (factor 1) say they pay, and no more than
+/// the costs times `start_cost_upper` allow, which can only start too few; the first thread
+/// started then times its own start, and `learn` starts the rest from that.
+const start_cost_upper = 3.0;
 
 /// The thread count that finishes `work_ns` (the rest of a search on one thread) soonest, the
 /// caller included; one if no more threads win. A thread asked for now does its first chunk
 /// `latency_ns` later, the caller spends `spawn_ns` on starting (and later joining) each of
 /// them, the later ones starting later, and the work is shared as chunks, so n threads finish
 /// after T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, against W on one. Two threads win when
-/// W > L + 2s, and the least T is at about n = sqrt(2 (W-L-s) / s). The costs are those
-/// measured (`StartCost`) times `start_cost_factor`.
-fn threadsForWork(work_ns: u64, latency_ns: u64, spawn_ns: u64, cores: u32) u32 {
+/// W > L + 2s, and the least T is at about n = sqrt(2 (W-L-s) / s). The costs are multiplied
+/// by `factor`.
+fn threadsForWork(work_ns: u64, latency_ns: u64, spawn_ns: u64, cores: u32, factor: f64) u32 {
     const w: f64 = @floatFromInt(work_ns);
-    const l: f64 = start_cost_factor * @as(f64, @floatFromInt(latency_ns));
-    const s: f64 = start_cost_factor * @as(f64, @floatFromInt(@max(1000, spawn_ns)));
+    const l: f64 = factor * @as(f64, @floatFromInt(latency_ns));
+    const s: f64 = factor * @as(f64, @floatFromInt(@max(1000, spawn_ns)));
     var best: u32 = 1;
     var best_t = w;
     var n: u32 = 2;
@@ -2573,7 +2577,14 @@ fn nowNs(io: Io) u64 {
 /// (`threadsForWork`), not from a file size: a search starts on the caller alone, a thread
 /// started by the search itself times starting a thread, and after the first chunk (W: the rest
 /// on one thread, from the chunks done) the caller starts the n threads that finish soonest,
-/// none if that is one. The model, T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, was checked
+/// none if that is one. The costs measured on a lone thread are a lower bound whose distance
+/// from the truth depends on the machine (`start_cost_upper`), so the decision is in two steps:
+/// the first starts one thread, at least, only if the measured costs themselves say threads pay,
+/// and no more than the costs times the upper bound allow; the first thread started times its
+/// own first chunk, and `.learn` then starts the others from the real latency (hosted runners,
+/// the factor that fits: 2.8 to 2.9 on x86-64, 0.6 to 0.9 on a Neoverse N2; a factor of 2.5 fitted
+/// on the Ryzen was 20 % slower than all threads at once on the arm64 runner). The model,
+/// T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, was checked
 /// against the gains of 2, 4 and 8 threads on 2 to 16 MB files, warm (cores busy just before)
 /// and cold (idle for 0.3 s): with the costs fitted it follows the observed gain of 2 threads
 /// within 5 to 10 % (4 MB `-c the` 0.61 ms observed, 0.65 predicted; 16 MB 2.51 and 2.66),
@@ -2625,10 +2636,14 @@ const Ramp = struct {
     max: u32,
     /// One thread per physical core (`physicalCores`), at most `max`.
     cores: u32,
-    state: enum { probe, pace, settle, measure, done },
+    state: enum { probe, learn, pace, settle, measure, done },
     /// The measurement of what starting a thread costs (`probe`), and the chunk size it is for.
     calib: ?*StartCost = null,
     chunk_bytes: usize = 0,
+    /// When the first helper was asked for, and what the caller spent per thread on asking
+    /// (`learn`).
+    spawn_ns: u64 = 0,
+    spawn_cost_ns: u64 = 0,
     /// `job.done_chunks` when the current phase started; read and work times when the
     /// measurement started.
     mark_chunks: u32 = 0,
@@ -2709,14 +2724,43 @@ const Ramp = struct {
                     return;
                 }
                 const per_chunk = job.chunk_ns.load(.monotonic) / done;
-                const best = threadsForWork(per_chunk * (job.nchunks - next), c.latencyNs(r.chunk_bytes), 2 * c.spawn_ns, r.cores);
-                if (best > r.active) r.spawnUpTo(job, best);
+                const w = per_chunk * (job.nchunks - next);
+                const latency = c.latencyNs(r.chunk_bytes);
+                const spawn = 2 * c.spawn_ns;
+                // Not even the measured costs, a lower bound, make threads pay: one thread.
+                if (threadsForWork(w, latency, spawn, r.cores, 1.0) == 1) {
+                    r.state = .done;
+                    return;
+                }
+                // At most what the costs times the upper bound allow, but a thread to learn
+                // the real cost from.
+                const first = @max(2, threadsForWork(w, latency, spawn, r.cores, start_cost_upper));
+                const t0 = nowNs(job.std_io);
+                r.spawn_ns = t0;
+                r.spawnUpTo(job, first);
+                r.spawn_cost_ns = (nowNs(job.std_io) - t0) / (first - 1);
+                if (r.active >= r.cores) {
+                    r.mark_chunks = done -% r.active;
+                    r.state = .pace;
+                } else {
+                    r.state = .learn;
+                }
+            },
+            .learn => {
+                // The first thread started has done a chunk: the time that took, less the chunk,
+                // is the latency of a thread in this search, and the calls to start the threads
+                // gave what the caller spends per thread. The threads the first decision left out
+                // start now if the real costs say they pay; none is stopped.
+                const hd = job.helper_done.load(.acquire);
+                if (hd == 0) return;
+                const per_chunk = job.chunk_ns.load(.monotonic) / @max(done, 1);
+                const latency = hd -| r.spawn_ns -| per_chunk;
+                const want = threadsForWork(per_chunk * (job.nchunks - next), latency, 2 * r.spawn_cost_ns, r.cores, 1.0);
+                if (want > r.active) r.spawnUpTo(job, want);
                 if (r.active < r.cores) {
                     r.state = .done;
                     return;
                 }
-                // One thread per core: the second thread of each is for `pace` to decide, which
-                // need not wait for a round of chunks first.
                 r.mark_chunks = done -% r.active;
                 r.state = .pace;
             },
@@ -3281,22 +3325,22 @@ test "lines around the zero-copy threshold keep their order and content" {
 }
 
 test "threadsForWork: one thread below the break-even, the cores for long searches" {
-    const l: u64 = 120_000;
-    const sp: u64 = 20_000; // 2 * spawn in StartCost is 40 us; the call is 20 us
-    const f = start_cost_factor;
-    const be: u64 = @intFromFloat(f * (@as(f64, @floatFromInt(l)) + 2 * @as(f64, @floatFromInt(2 * sp))));
-    try testing.expectEqual(@as(u32, 1), threadsForWork(be - be / 20, l, 2 * sp, 8));
-    try testing.expect(threadsForWork(be + be / 5, l, 2 * sp, 8) >= 2);
-    try testing.expectEqual(@as(u32, 1), threadsForWork(0, l, 2 * sp, 8));
-    try testing.expectEqual(@as(u32, 8), threadsForWork(100_000_000, l, 2 * sp, 8));
-    try testing.expectEqual(@as(u32, 1), threadsForWork(100_000_000, l, 2 * sp, 1));
+    const l: u64 = 300_000;
+    const sp: u64 = 100_000;
+    // Two threads win where W > L + 2s (here 500 us).
+    try testing.expectEqual(@as(u32, 1), threadsForWork(480_000, l, sp, 8, 1.0));
+    try testing.expect(threadsForWork(540_000, l, sp, 8, 1.0) >= 2);
+    try testing.expectEqual(@as(u32, 1), threadsForWork(0, l, sp, 8, 1.0));
+    try testing.expectEqual(@as(u32, 8), threadsForWork(100_000_000, l, sp, 8, 1.0));
+    try testing.expectEqual(@as(u32, 1), threadsForWork(100_000_000, l, sp, 1, 1.0));
     // More work never starts fewer threads; costlier threads never start more.
     var prev: u32 = 1;
     var w: u64 = 10_000;
     while (w < 50_000_000) : (w += w / 3 + 1) {
-        const n = threadsForWork(w, l, 2 * sp, 16);
+        const n = threadsForWork(w, l, sp, 16, 1.0);
         try testing.expect(n >= prev);
-        try testing.expect(threadsForWork(w, 4 * l, 8 * sp, 16) <= n);
+        try testing.expect(threadsForWork(w, l, sp, 16, start_cost_upper) <= n);
+        try testing.expect(threadsForWork(w, 4 * l, 4 * sp, 16, 1.0) <= n);
         prev = n;
     }
 }

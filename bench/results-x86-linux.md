@@ -415,7 +415,7 @@ less that of a 128 KB file. Gain in ms over `-j 1`, observed / predicted, with L
 fitted (warm L 0.31, s 0.134; cold L 0.94, s 0.200, rms 0.12 and 0.24 ms; the measured values
 are 0.12 and 0.041 warm, 0.36 and 0.105 cold, so the measured costs are lower bounds, 1.9 to
 3.3 times too low: the helpers also contend for the kernel's locks, find the file cold in their
-caches and are joined; `start_cost_factor` 2.5):
+caches and are joined; the factor that fits was 2.5 on this Ryzen and 2.8 to 2.9 on the hosted x86-64 runner, 0.6 to 0.9 on the hosted arm64 one, see below):
 
 | state | size, search | W | 2 threads | 4 threads | 8 threads |
 |---|---|---|---|---|---|

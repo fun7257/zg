@@ -1,6 +1,6 @@
 # zg: notes for agents
 
-zg is a single-file, line-oriented, case-sensitive literal search in Zig 0.16 (SIMD inside chunks,
+zg is a single-file, line-oriented, case-sensitive literal search in Zig 0.17 (SIMD inside chunks,
 all cores across them), as a command line tool and as a library. README.md says what it does and how
 it works; this file is what is not obvious from the code.
 
@@ -22,7 +22,7 @@ it works; this file is what is not obvious from the code.
 
 ```
 zig build                    # zg and the bench tools in zig-out/bin (compare looks for zg there)
-zig build test               # ReleaseSafe; add -Dtest-optimize=Debug for Debug
+zig build test               # ReleaseSafe; add -Dtest-optimize=debug for Debug
 zig build test-levels        # the tests for x86-64 v1, v2, v3, as far as the machine runs them
 zig build -Dcpu=baseline     # the portable x86-64 build (cores for v2 and v3 inside)
 .github/smoke.sh zig-out/bin/zg [v1 v2 v3]   # output against grep -F (levels: portable build)
@@ -62,6 +62,14 @@ on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t
   `threadsFor` allows fewer threads; to move the numbers, sweep `--mem` over the standard cases that
   print much (`the`, `-n a`, short.txt `a`) and watch the time and, with `--io=pread`, the peak RSS.
   Do not tie the default to the machine's memory: a container does not tell (it was killed).
+- **Zig 0.17.0 compiler crash**: `zig build -Dcpu=baseline -Dstrip=true` (the whole dev step) kills
+  the compiler with SIGSEGV while building `bench` and `stress`; `zg` itself, `zig build install`
+  (what `package.sh` runs) and the same build without `-Dstrip` are fine. A `.zig-cache` left
+  behind by such a crash fails later builds with `FileNotFound` on files in `.zig-cache/o`: delete it.
+- **Zig 0.17 renames this code uses**: `std.lang.Optimize` (`.debug/.safe/.fast/.small`,
+  `-Dtest-optimize=debug`), `builtin.target.cpu/os` (the old `builtin.cpu/os` go in 0.18), `@Int`
+  (`std.meta.Int` is gone), `@splat` (no `**`), `addPassthruArgs`. `zig build install` can no longer
+  set its directory in `build.zig`: use `--prefix-exe-dir PATH`.
 - **Vector width** is 16 bytes without AVX2 (SSE2, NEON), 32 with: 32 on SSE2 was twice as slow.
 - **Linux specifics**, each measured (see results-x86-linux.md): `pread` from page boundaries (a
   copy offset by a byte is 3-6x slower); chunk size is at most a thread's share of L2, read from

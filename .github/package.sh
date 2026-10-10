@@ -21,7 +21,7 @@ fi
 
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
-zig build install -Dbin-dir="$stage" -Dstrip=true "$@"
+zig build install --prefix-exe-dir "$stage" -Dstrip=true "$@"
 bin=$stage/zg
 
 reported=$("$bin" --version | head -1)

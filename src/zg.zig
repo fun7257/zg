@@ -279,7 +279,7 @@ fn l2PerThread(io: Io) usize {
     };
     const c = S.cached.load(.monotonic);
     if (c != 0) return c;
-    const share = readL2PerThread(io) orelse if (builtin.cpu.arch.isX86()) 256 * 1024 else 2 * 1024 * 1024;
+    const share = readL2PerThread(io) orelse if (builtin.target.cpu.arch.isX86()) 256 * 1024 else 2 * 1024 * 1024;
     S.cached.store(share, .monotonic);
     return share;
 }
@@ -299,7 +299,7 @@ fn physicalCores(io: Io) usize {
 }
 
 fn readPhysicalCores(io: Io, cpus: usize) ?usize {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => return sysctlInt("hw.physicalcpu"),
         .linux => {
             var buf: [256]u8 = undefined;
@@ -312,7 +312,7 @@ fn readPhysicalCores(io: Io, cpus: usize) ?usize {
 }
 
 fn readL2PerThread(io: Io) ?usize {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => {
             // The performance cores' L2 (perflevel0), else the one L2 of older systems.
             const size = sysctlInt("hw.perflevel0.l2cachesize") orelse sysctlInt("hw.l2cachesize") orelse return null;
@@ -408,7 +408,7 @@ test "cache sizes and CPU lists from sysfs" {
 /// it. The chunk timings do not see it; spread over the chunks, it is a cost per byte for
 /// each of the threads it holds back. (Not seen on macOS.)
 fn unmapCost(nthreads: usize) u64 {
-    if (builtin.os.tag != .linux) return 0;
+    if (builtin.target.os.tag != .linux) return 0;
     return 100 * 1000 / std.heap.pageSize() * nthreads;
 }
 
@@ -1399,7 +1399,7 @@ const min_default_limit = 32 << 20;
 /// Memory the system can hand out right now without swapping: free pages plus pages it
 /// reclaims cheaply (clean page cache, speculative and purgeable pages). Null if unknown.
 fn availableMemory(io: Io) ?u64 {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => {
             // `vm_statistics64` up to the fields we need; the kernel fills as many fields
             // as `count` says, so the prefix is enough on any OS version.
@@ -2161,7 +2161,7 @@ const BusGuard = struct {
     }
 
     fn handle(sig: std.posix.SIG, info: *const std.posix.siginfo_t, ctx: ?*anyopaque) callconv(.c) void {
-        const addr: usize = switch (builtin.os.tag) {
+        const addr: usize = switch (builtin.target.os.tag) {
             .linux => @intFromPtr(info.fields.sigfault.addr),
             else => @intFromPtr(info.addr),
         };
@@ -2292,7 +2292,7 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
     var job: Job = .{
         .data = mapped,
         .access = .{
-            .allowed = if (mapping == null) .{ false, true, false } else if (kind == .shared and builtin.os.tag == .linux and io_choice == .auto and Pool.sizeClass(size) >= Pool.chunk_choice_class)
+            .allowed = if (mapping == null) .{ false, true, false } else if (kind == .shared and builtin.target.os.tag == .linux and io_choice == .auto and Pool.sizeClass(size) >= Pool.chunk_choice_class)
                 // Shared engines on Linux, large files: `pread` only. Unmapping the pages a
                 // mapped search faulted in takes the process's address space lock for long
                 // (14 ms for 540 MB), and every other search's `mmap`, `munmap` and page
@@ -3428,7 +3428,7 @@ test "a file truncated during a search never brings the process down" {
         if (result) |_| {
             // Only a mapping that keeps showing the old contents (macOS) gets here, and
             // then the output is that of the old contents.
-            try testing.expect(io_choice == .mmap and builtin.os.tag.isDarwin());
+            try testing.expect(io_choice == .mmap and builtin.target.os.tag.isDarwin());
             const want = try expectedOutput(gpa, data, opts);
             defer gpa.free(want);
             try testing.expectEqualStrings(want, sw.out.written());
@@ -3480,7 +3480,7 @@ test "a one-shot search with the truncation guard survives the file being trunca
         t.join();
         if (result) |_| {
             // Only a mapping that keeps showing the old contents (macOS) gets here.
-            try testing.expect(io_choice == .mmap and builtin.os.tag.isDarwin());
+            try testing.expect(io_choice == .mmap and builtin.target.os.tag.isDarwin());
             const want = try expectedOutput(gpa, data, opts);
             defer gpa.free(want);
             try testing.expectEqualStrings(want, sw.out.written());
@@ -3500,7 +3500,7 @@ test "a shared engine plans small searches from earlier ones and keeps measuring
         p.priors[0].rate[pl.index] = @floatFromInt(k + 1); // the first one is fastest
     }
     // Then mostly the fastest, and every `explore_every`-th search another one.
-    var picks = [_]usize{0} ** n;
+    var picks: [n]usize = @splat(0);
     const rounds = Pool.Priors.explore_every * 8;
     for (0..rounds) |_| picks[p.plan(0).?.index] += 1;
     try testing.expectEqual(rounds - rounds / Pool.Priors.explore_every, picks[0]);

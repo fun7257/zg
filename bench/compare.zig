@@ -208,7 +208,7 @@ const Ctx = struct {
     /// Peak memory in MB: the footprint reported by `/usr/bin/time -l` on macOS, the peak
     /// RSS from `wait4` elsewhere (which includes the pages of the file mapping touched).
     fn footprint(c: Ctx, args: []const []const u8) !f64 {
-        if (!builtin.os.tag.isDarwin()) return (try c.run(args)).max_rss_mb;
+        if (!builtin.target.os.tag.isDarwin()) return (try c.run(args)).max_rss_mb;
         var list: std.ArrayList([]const u8) = .empty;
         defer list.deinit(c.gpa);
         try list.appendSlice(c.gpa, &.{ "/usr/bin/time", "-l" });
@@ -455,7 +455,7 @@ fn small(c: Ctx) !void {
 }
 
 fn memory(c: Ctx) !void {
-    const what = if (builtin.os.tag.isDarwin()) "Peak memory footprint (MB, from /usr/bin/time -l)" else "Peak RSS (MB, from wait4; includes the mapped file pages touched)";
+    const what = if (builtin.target.os.tag.isDarwin()) "Peak memory footprint (MB, from /usr/bin/time -l)" else "Peak RSS (MB, from wait4; includes the mapped file pages touched)";
     std.debug.print("\n## {s}\n\n| file | pattern | output | zg default | zg --mem=256M | zg -j 1 | rg |\n|---|---|---|---|---|---|---|\n", .{what});
     const picks = [_]Case{ default_cases[0], default_cases[5], default_cases[6], default_cases[8], default_cases[12] };
     for (picks) |cs| {
@@ -500,7 +500,7 @@ fn cold(c: Ctx) !void {
     }
     defer for (names) |n| Io.Dir.cwd().deleteFile(c.io, n) catch {};
 
-    if (builtin.os.tag == .linux) {
+    if (builtin.target.os.tag == .linux) {
         // Dirty pages are not dropped: write the copies out first.
         for (names) |n| {
             const file = try Io.Dir.cwd().openFile(c.io, n, .{});

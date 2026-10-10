@@ -17,7 +17,7 @@ const levels = if (build_options.cpu_dispatch) struct {
 /// while other threads allocate memory. zg starts its threads as a search needs them
 /// (`Ramp` in zg.zig), so this is on the path of every search.
 pub const std_options: std.Options = .{
-    .signal_stack_size = if (builtin.mode == .Debug) 1 << 18 else null,
+    .signal_stack_size = if (builtin.mode == .debug) 1 << 18 else null,
 };
 
 const usage =
@@ -272,7 +272,7 @@ fn printVersion(io: Io, level: ?Level) void {
     var buf: [256]u8 = undefined;
     var fw = Io.File.stdout().writerStreaming(io, &buf);
     const w = &fw.interface;
-    w.print("zg {s}\n{t}-{t}, built for {s}", .{ build_options.version, builtin.cpu.arch, builtin.os.tag, builtin.cpu.model.name }) catch return;
+    w.print("zg {s}\n{t}-{t}, built for {s}", .{ build_options.version, builtin.target.cpu.arch, builtin.target.os.tag, builtin.target.cpu.model.name }) catch return;
     if (level) |l| w.print(" with cores for x86-64 v1, v2, v3; running {t}", .{l}) catch return;
     w.writeAll("\n") catch return;
     w.flush() catch {};
@@ -284,7 +284,7 @@ const Level = enum { v1, v2, v3 };
 /// models define them (each feature they enable is checked: the compiler may use any), and
 /// for v3 with the AVX state enabled by the operating system.
 fn cpuLevel() Level {
-    if (builtin.cpu.arch != .x86_64) return .v1;
+    if (builtin.target.cpu.arch != .x86_64) return .v1;
     const max_leaf = cpuid(0, 0).eax;
     const max_ext = cpuid(0x8000_0000, 0).eax;
     if (max_leaf < 7 or max_ext < 0x8000_0001) return .v1;

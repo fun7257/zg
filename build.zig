@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)") orelse .ReleaseFast;
+    const optimize = b.option(std.lang.Optimize, "optimize", "Optimization mode (default: fast)") orelse .fast;
 
     // Debug information is left out of the binaries of a release (`-Dstrip`): 4.8 MB to about 0.4.
     const strip = b.option(bool, "strip", "Leave debug information out of zg (default: no)") orelse false;
@@ -58,25 +58,17 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{ .name = "zg", .root_module = exe_mod });
 
     // `zig build` (the default step) puts zg and the benchmark tools in zig-out/bin, where
-    // `compare` looks for zg. `zig build install` is for installing zg itself: only zg,
-    // into ~/.local/bin, or into `-Dbin-dir=PATH`.
+    // `compare` looks for zg. `zig build install` is for installing zg itself: only zg, into
+    // the prefix's bin directory (`--prefix-exe-dir PATH` for another one, e.g. ~/.local/bin).
     const dev = b.step("dev", "Build zg and the benchmark tools into zig-out/bin (the default)");
     b.default_step = dev;
     const dev_dir: std.Build.InstallDir = .{ .custom = "bin" };
     dev.dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = dev_dir } }).step);
-    const bin_dir = b.option([]const u8, "bin-dir", "Where `zig build install` puts zg (default: ~/.local/bin)") orelse
-        if (b.graph.environ_map.get("HOME")) |home| b.pathJoin(&.{ home, ".local", "bin" }) else null;
-    b.install_tls.description = "Install zg (only zg) into ~/.local/bin, or -Dbin-dir=PATH";
-    if (bin_dir) |dir| {
-        b.exe_dir = dir;
-        b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{}).step);
-    } else {
-        const fail = b.addFail("zig build install: HOME is not set; give the directory with -Dbin-dir=PATH");
-        b.getInstallStep().dependOn(&fail.step);
-    }
+    b.install_tls.description = "Install zg (only zg): into zig-out/bin, or --prefix-exe-dir PATH";
+    b.getInstallStep().dependOn(&b.addInstallArtifact(exe, .{}).step);
 
     const run = b.addRunArtifact(exe);
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run zg").dependOn(&run.step);
 
     // In-process benchmark of the core: `zig build bench -- FILE PATTERN [options]`.
@@ -91,7 +83,7 @@ pub fn build(b: *std.Build) void {
     });
     dev.dependOn(&b.addInstallArtifact(bench, .{ .dest_dir = .{ .override = dev_dir } }).step);
     const bench_run = b.addRunArtifact(bench);
-    if (b.args) |args| bench_run.addArgs(args);
+    bench_run.addPassthruArgs();
     b.step("bench", "Run the in-process benchmark").dependOn(&bench_run.step);
 
     // Concurrent searches on one engine: `zig build stress -- BIG_FILE SMALL_FILE`.
@@ -106,7 +98,7 @@ pub fn build(b: *std.Build) void {
     });
     dev.dependOn(&b.addInstallArtifact(stress, .{ .dest_dir = .{ .override = dev_dir } }).step);
     const stress_run = b.addRunArtifact(stress);
-    if (b.args) |args| stress_run.addArgs(args);
+    stress_run.addPassthruArgs();
     b.step("stress", "Run concurrent searches on one engine").dependOn(&stress_run.step);
 
     // Corpus generator and the zg-vs-ripgrep comparison driver (`zig build gen -- DIR`,
@@ -122,12 +114,12 @@ pub fn build(b: *std.Build) void {
         });
         dev.dependOn(&b.addInstallArtifact(tool, .{ .dest_dir = .{ .override = dev_dir } }).step);
         const tool_run = b.addRunArtifact(tool);
-        if (b.args) |args| tool_run.addArgs(args);
+        tool_run.addPassthruArgs();
         b.step(name, b.fmt("Run bench/{s}.zig", .{name})).dependOn(&tool_run.step);
     }
 
     // Tests keep runtime safety checks (overflow, bounds, ...) on, unlike the release binary.
-    const test_optimize = b.option(std.builtin.OptimizeMode, "test-optimize", "Optimization mode for tests (default: ReleaseSafe)") orelse .ReleaseSafe;
+    const test_optimize = b.option(std.lang.Optimize, "test-optimize", "Optimization mode for tests (default: safe)") orelse .safe;
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/zg.zig"),

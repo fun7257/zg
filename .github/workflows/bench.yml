@@ -10,7 +10,9 @@ name: Performance
 # job fails when the geometric mean over the 39 cases is more than `threshold` percent slower than
 # the previous state. Runners are shared machines: read single cases as indications, the mean as
 # the result. Also weekly on the default branch (against ripgrep only), and by hand with a ref to
-# compare with.
+# compare with. Each platform job also runs the thread count sweep (.github/thread-sweep.py: what
+# starting a thread costs, the gain of 2 to 4 threads against the model, one thread against the
+# default against all threads, by file size, warm and cold); `only_threads` runs just that.
 #
 # CPU levels. One job per platform, and in it every CPU level one after the other
 # (.github/bench-variants.sh): a hosted runner is a different CPU model from one job to the next,
@@ -40,6 +42,10 @@ on:
         description: "Fail when slower than the base by more than this many percent (0: never)"
         required: false
         default: "15"
+      only_threads:
+        description: "Run only the thread count sweep, not the benchmark (true or false)"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
@@ -115,6 +121,7 @@ jobs:
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
       - name: Benchmark
+        if: inputs.only_threads != 'true'
         shell: bash
         env:
           PLATFORM: ${{ matrix.id }}
@@ -132,6 +139,18 @@ jobs:
             cat "$f" >> "$GITHUB_STEP_SUMMARY"
           done
           exit $status
+
+      # Thread count by file size, warm and cold (about 10 minutes): the model behind
+      # `threadsForWork` against what this machine does.
+      - name: Thread count by size
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p bench-out
+          zig build
+          [ -f bench-corpus/words.txt ] || zig-out/bin/gen bench-corpus > /dev/null
+          python3 .github/thread-sweep.py --bin zig-out/bin --corpus bench-corpus \
+            --out "bench-out/threads-${{ matrix.id }}.txt" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -157,8 +176,11 @@ jobs:
       - name: Merge the reports
         run: |
           mkdir summary
-          python3 .github/summarize.py reports/*/*.md --csv summary/results.csv > summary/summary.md
-          cat summary/summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+          if ls reports/*/*.md > /dev/null 2>&1; then
+            python3 .github/summarize.py reports/*/*.md --csv summary/results.csv > summary/summary.md
+            cat summary/summary.md | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          cp reports/*/threads-*.txt summary/ 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:

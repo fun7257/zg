@@ -460,6 +460,38 @@ thread to a half; files from 32 MB on pay the wait for the first chunk and the m
 before the threads start, 0.2 to 0.35 ms: 3 to 5 % on 32 to 128 MB, 0.7 % on 515 MB. The 39
 standard cells 0.996x; CPU time against ripgrep unchanged.
 
+**Other CPUs** (hosted runners, `.github/thread-sweep.py` through the Performance workflow with
+`only_threads`, 15 rounds, 3 or 4 CPUs, runs 38036037681 and 38045790082). Starting a thread,
+median of 40, warm / cold, in us (first instruction, 1 chunk-size buffer, `spawn` call):
+
+| platform | chunk | first instruction | buffer | `spawn` call | kappa that fits (warm, cold) |
+|---|---|---|---|---|---|
+| x86-64, 4 CPUs | 256 KB | 36 / 65 | 195 / 258 | 29 / 41 | 2.8, 2.3 (the Ryzen: 2.5) |
+| arm64 Neoverse N2, 4 CPUs | 1 MB | 48 / 131 | 532 / 824 | 36 / 48 | 1.0, 0.6 |
+| macOS M1 (virtual), 3 CPUs | 2 MB | 42 / 35 | 259 / 267 | 30 / 23 | too noisy (3.1, 8.0; rms 0.9 to 2.3 ms) |
+
+kappa is the factor on the measured L and s that makes the predicted gain of 2 and 4 threads
+closest to the observed (4 to 32 MB, `-c the` and `the` printing lines). The costs measured on a
+lone thread are lower bounds of what the helpers pay, and how far below depends on the machine,
+hence the two steps (`start_cost_upper`). Default against one thread and against all threads at
+once (wall time ratio, warm; below 1 the default is faster), first run:
+
+| size | x86 one / all | arm64 one / all | macOS one / all |
+|---|---|---|---|
+| 1 MB | 1.05 / 0.92 | 1.05 / 0.99 | 1.08 / 1.07 |
+| 4 MB | 0.90 / 0.99 | 0.83 / 1.12 | 0.98 / 1.19 |
+| 16 MB | 0.59 / 1.02 | 0.45 / 1.07 | 0.77 / 1.12 |
+| 64 MB | 0.43 / 1.05 | 0.35 / 1.07 | 0.56 / 1.08 |
+
+The default is 40 to 65 % faster than one thread from 8 MB on, on all three, but 2 to 12 % slower
+than all threads at once from 2 MB on arm64 and 4 to 5 % on x86-64 from 8 MB. The second run,
+with the two steps (the first thread started times itself and the others follow from it), did
+not change that on arm64 (4 MB 1.10, 8 MB 1.11, 16 MB 1.07, 64 MB 1.07): the loss is not too
+few threads but the wait before the first one is started. The decision comes after the first
+chunk, which takes about 0.3 to 0.4 ms of a 1 MB chunk on the arm64 runner (a 256 KB chunk of
+x86-64: 0.05 to 0.1 ms), and after the measuring thread has reported (60 to 250 us): a fixed
+0.3 to 0.5 ms that is 3 to 10 % of a search of 5 to 10 ms and 0.5 % of one of 100 ms.
+
 What was tried on the way:
 
 - **A first table that was wrong.** Thread count against file size, each setting run in a

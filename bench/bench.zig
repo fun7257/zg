@@ -13,15 +13,55 @@ const zg = @import("zg");
 
 const usage =
     \\usage: bench FILE PATTERN [-n] [-c] [-j=N] [--io=M] [--mem=S] [--sink=null|file|mem] [--chunk=S] [--runs=N] [--alloc=page]
+    \\       bench --start-cost
     \\
 ;
 
 const Sink = enum { null, file, mem };
 
+const Probe = struct {
+    io: Io,
+    begin_ns: u64,
+    run_ns: std.atomic.Value(u64) = .init(0),
+    buffer_ns_per_kb: std.atomic.Value(u64) = .init(0),
+    done: std.atomic.Value(u32) = .init(0),
+
+    fn work(p: *Probe) void {
+        p.run_ns.store(nowNs(p.io), .release);
+        const bytes = 64 * 1024;
+        const t0 = nowNs(p.io);
+        if (std.heap.page_allocator.alloc(u8, bytes)) |buf| {
+            var i: usize = 0;
+            while (i < buf.len) : (i += 4096) buf[i] = 1;
+            std.mem.doNotOptimizeAway(buf.ptr);
+            std.heap.page_allocator.free(buf);
+        } else |_| {}
+        p.buffer_ns_per_kb.store((nowNs(p.io) - t0) / (bytes / 1024), .monotonic);
+        p.done.store(1, .release);
+    }
+};
+
+fn nowNs(io: Io) u64 {
+    return @intCast(@max(0, Io.Timestamp.now(io, .awake).nanoseconds));
+}
+
+fn startCost(io: Io) !void {
+    var probe: Probe = .{ .io = io, .begin_ns = nowNs(io) };
+    const t = try std.Thread.spawn(.{}, Probe.work, .{&probe});
+    const spawn_ns = nowNs(io) - probe.begin_ns;
+    t.join();
+    std.debug.print("{d} {d} {d} {d}\n", .{ probe.run_ns.load(.monotonic) -| probe.begin_ns, probe.buffer_ns_per_kb.load(.monotonic), spawn_ns, std.Thread.getCpuCount() catch 1 });
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     var gpa = init.gpa;
+
+    // `bench --start-cost`: what starting a thread costs now, on one line, measured the way
+    // `StartCost` in src/zg.zig does (the thread is the same kind, the numbers are comparable):
+    // run_ns buffer_ns_per_kb spawn_ns cpus.
+    if (argv.len == 2 and std.mem.eql(u8, argv[1], "--start-cost")) return startCost(io);
 
     var opts: zg.Options = .{ .pattern = "" };
     var path: ?[]const u8 = null;

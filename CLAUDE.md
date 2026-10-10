@@ -36,8 +36,10 @@ x86-64, Linux aarch64 and macOS.
 **Concurrency bugs are flaky.** The shared engine had a use-after-free (`Job.leave` read the job
 after dropping `inflight`, which lets `Pool.remove` free it) that showed in 1 of 25 full runs on
 4 CPUs. After a change to the shared engine, thread start/stop or the pool, run the tests many times
-on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t` and then
-`taskset -c 0-3 ./t` in a loop (hundreds of runs of `--test-filter "shared engine"`).
+on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-filter "shared engine" --test-no-exec
+-femit-bin=t` and then `taskset -c 0-3 ./t` in a loop (hundreds of runs). Since Zig 0.17 the filter
+is given to the compiler: the test binary rejects `--test-filter` ("unrecognized command line
+argument") and every run aborts.
 
 ## Things that break quietly
 
@@ -70,6 +72,19 @@ on few CPUs, e.g. `zig test src/zg.zig -OReleaseSafe --test-no-exec -femit-bin=t
   `-Dtest-optimize=debug`), `builtin.target.cpu/os` (the old `builtin.cpu/os` go in 0.18), `@Int`
   (`std.meta.Int` is gone), `@splat` (no `**`), `addPassthruArgs`. `zig build install` can no longer
   set its directory in `build.zig`: use `--prefix-exe-dir PATH`.
+- **Thread count comes from measured costs, not a file size** (`StartCost`, `threadsForWork`, `Ramp`
+  in `zg.zig`). A thread started with the search times starting a thread; after the first chunk the
+  caller picks the n of the least T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n. The costs are not
+  constants: a thread starts 70 to 320 us after the cores were idle and 22 to 73 us when they were
+  busy, so a threshold fitted on back-to-back benchmark runs is wrong for an interactive run.
+  `start_cost_factor` (2.5) is the fitted-over-measured ratio: the lone thread measures a lower
+  bound. To check or retune: run fixed `-j 1/2/4/8` in a warm (just after a 16-thread run) and a
+  cold (0.3 s idle) state, fit L and s to the observed gains (see `bench/results-x86-linux.md`) and
+  compare with the measurements. The model ignores memory bandwidth (more than about 4 threads do
+  not help a 10 GB/s-per-thread scan) and the writer. Shared engines and `-m` do not use it.
+  **Measure such things with the builds alternating in rotating order, never one setting after
+  another**: a first table (each thread count in a block of its own) was wrong because the clock
+  rate followed the order of the blocks.
 - **Vector width** is 16 bytes without AVX2 (SSE2, NEON), 32 with: 32 on SSE2 was twice as slow.
 - **Linux specifics**, each measured (see results-x86-linux.md): `pread` from page boundaries (a
   copy offset by a byte is 3-6x slower); chunk size is at most a thread's share of L2, read from

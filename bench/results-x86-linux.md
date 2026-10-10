@@ -379,6 +379,115 @@ faster (geometric mean; 0.94x to 1.25x), the 54 worst cells 1.15x (0.94x to 1.92
 rg (geometric mean): all cores 1.36x on the standard cells and 1.46x on the worst, one
 thread 0.67x and 0.63x.
 
+## Thread count from measured costs (2026-10-10)
+
+The ramp above started one thread per core at once (fewer for files under 8 chunks per
+thread). A one-shot search now starts on the caller alone and starts threads after its first
+chunk, as many as the model below says finish soonest (`threadsForWork`, `Ramp.probe` in
+src/zg.zig). It uses no file size: where threads begin to pay depends on the time the search
+takes on one thread, W, which depends on the pattern (single-thread rates here: 9.7 GB/s for
+`-c needle_zz`, 3.5 for `-c the`, 2.8 for `the` printing lines), and on what starting a
+thread costs, which depends on whether the other cores were just busy.
+
+**Model.** n threads are asked for at the same moment; the caller spends s on starting (and
+later joining) each, so the i-th starts working at i*s + L, L being the time from asking to the
+first chunk's work; the work is shared as chunks. Then T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n
+against W on one thread: n threads win where W > L + s(1 + n/2), two where W > L + 2s, and the
+least T is at n = sqrt(2 (W-L-s) / s). The caller measures W from the chunks done. L and s are
+measured by a detached thread started with the search (`StartCost`), which times its own
+start and the getting of a buffer, and the caller's `spawn` call.
+
+**What starting a thread costs** (median of 40 runs, 16 MB file; thread start measured
+by `StartCost`, the buffer being 256 KB):
+
+| state | thread runs its first instruction | buffer of the first chunk | `spawn` call |
+|---|---|---|---|
+| cores busy just before | 22 to 73 us | 98 to 290 us | 19 to 40 us |
+| cores idle for 0.4 s | 69 to 320 us | 157 to 294 us | 39 to 78 us |
+
+The same 2 MB search, `-c the`: 1.55 ms with `-j 1` and 1.24 ms with `-j 8` right after
+16-thread runs; 3.13 and 3.46 ms after 0.4 s idle. A file size threshold fitted in back-to-back
+benchmark runs is wrong for a command typed now and then.
+
+**Checking the model.** Fixed `-j 1/2/4/8`, medians of 21 rounds in rotating order, the
+cores made busy (a 16-thread run) or idle (0.3 s) before every run; W is the time on one thread
+less that of a 128 KB file. Gain in ms over `-j 1`, observed / predicted, with L and s
+fitted (warm L 0.31, s 0.134; cold L 0.94, s 0.200, rms 0.12 and 0.24 ms; the measured values
+are 0.12 and 0.041 warm, 0.36 and 0.105 cold, so the measured costs are lower bounds, 1.9 to
+3.3 times too low: the helpers also contend for the kernel's locks, find the file cold in their
+caches and are joined; `start_cost_factor` 2.5):
+
+| state | size, search | W | 2 threads | 4 threads | 8 threads |
+|---|---|---|---|---|---|
+| warm | 4 MB `-c the` | 1.50 | 0.61 / 0.65 | 0.85 / 0.94 | 0.84 / 1.03 |
+| warm | 8 MB `-c the` | 2.54 | 1.09 / 1.17 | 1.41 / 1.72 | 1.60 / 1.94 |
+| warm | 16 MB `-c the` | 5.51 | 2.51 / 2.66 | 3.60 / 3.95 | 4.08 / 4.54 |
+| warm | 16 MB `-c needle_zz` | 2.63 | 1.01 / 1.21 | 1.39 / 1.79 | 1.21 / 2.01 |
+| warm | 2 MB `-c needle_zz` | 0.42 | 0.08 / 0.11 | 0.00 / 0.13 | -0.08 / 0.08 |
+| cold | 2 MB `-c needle_zz` | 0.58 | -0.14 / 0.00 | -0.39 / -0.07 | -0.86 / -0.27 |
+| cold | 2 MB `the` (lines) | 1.22 | -0.11 / 0.33 | -0.19 / 0.41 | -0.58 / 0.30 |
+| cold | 8 MB `-c the` | 3.26 | 1.06 / 1.35 | 1.52 / 1.94 | 1.35 / 2.08 |
+
+The form holds: 2 threads within 5 to 10 % where threads win, and the signs where they lose.
+It is too hopeful with more threads, for two reasons it does not contain. Bandwidth: 16 MB
+`-c needle_zz` (9.7 GB/s on one thread) gains less with 8 threads than with 4, saturated at
+about 4 threads where the memory delivers about 33 GB/s (the roofline: threads <= B / r1,
+r1 the rate of one), while `-c the` (3.5 GB/s) is still gaining at 8 (saturation at about 9).
+The writer of searches that print lines is serial. Neither is modelled; the second thread of
+each core is decided from the share of time in the copy as before, and at most one thread per
+core is started by the model.
+
+**Result.** Words.txt prefixes cached, `--io=pread`, wall time in ms, geometric mean over
+`-c needle_zz`, `-c the` and `the` (lines), the builds alternating in rotating order. "Per
+core" is the build before (one thread per core at once), "ranges" a build with fixed ranges of
+file size (one thread under 4 MiB, one per core from 32 MiB, the model between), "model" the
+final one:
+
+| size | warm: one thread | per core | ranges | model | cold: one thread | per core | ranges | model |
+|---|---|---|---|---|---|---|---|---|
+| 1 MB | 1.99 | | 1.89 | 1.94 | 2.81 | | 2.81 | 2.83 |
+| 2 MB | 2.15 | | 2.12 | 2.16 | 3.20 | | 3.21 | 3.30 |
+| 4 MB | 2.53 | | 2.55 | 2.30 | 4.16 | | 3.87 | 3.93 |
+| 8 MB | 3.23 | | 2.74 | 2.29 | 5.07 | | 4.26 | 4.24 |
+| 16 MB | 5.49 | | 3.32 | 2.53 | 8.17 | | 5.62 | 5.36 |
+| 32 MB | 8.48 | 3.34 | 4.14 | 3.48 | 10.96 | | 6.20 | 6.46 |
+| 128 MB | 30.0 | 6.80 | 7.14 | 7.16 | 32.3 | | 10.9 | 11.0 |
+
+("Per core" and "ranges" are the same code from 32 MB; the runs differ by the state of the
+machine, 10 to 20 % at 8 to 32 MB, so compare within a row of one run.) Against one thread per
+core at once the model takes 7 to 24 % less time on 4 to 32 MB warm and the CPU time of one
+thread to a half; files from 32 MB on pay the wait for the first chunk and the measurement
+before the threads start, 0.2 to 0.35 ms: 3 to 5 % on 32 to 128 MB, 0.7 % on 515 MB. The 39
+standard cells 0.996x; CPU time against ripgrep unchanged.
+
+What was tried on the way:
+
+- **A first table that was wrong.** Thread count against file size, each setting run in a
+  block of its own, showed 2 to 8 MB files twice as fast with 8 to 16 threads as with the
+  default. Run alternating it was the other way round: the clock rate of the laptop followed
+  the order of the blocks. In process (`bench`) a 2 MB search takes 0.3 ms on one thread and
+  0.5 ms on 8: the 1 to 2 ms of the command is the process.
+- **Fixed ranges of file size** (one thread under 4 MiB, one per core from 32 MiB, in between
+  a thread for each N = s / epsilon of W after heartbeat scheduling, Acar et al., PLDI 2018):
+  as good as the model warm, but the 4 MiB was where W is about a millisecond for this pattern
+  and this machine in this state; for a search printing lines it is 1 MB, and cold the start of
+  a thread costs three times more.
+- **Other ways to find the count**, 4 to 64 MB, wall and CPU time against the build before
+  (geometric mean): a thread for each 500 us of W, with a shortcut from 64 MB (0.88 to 0.93,
+  0.74 to 0.76); the first thread timed until the end of its first chunk, then sqrt(W / tau)
+  threads (0.94, 0.72); sqrt(W / tau) with a worst-case tau as the first guess (0.96 to 0.99,
+  0.68 to 0.71, too few threads for 4 to 16 MB); the start latency and s as two terms, without
+  the stagger of the starts (1.05, 0.94); epsilon 10 % instead of 5 %: 0.98, 0.85.
+- **Raising the threads started at once for small files** (the divisor of `nchunks`, one
+  thread per chunk, all threads from 2 MB): no gain, 3 to 20 % either way by case.
+- **All threads for a file too short to measure the second thread of each core** (what
+  `pace` used to do after a probe): 25 to 50 % more CPU time on 2 to 32 MB files without making
+  them faster; it stays at one per core.
+- **Timing a thread's start with a 256 KB buffer** cost 0.4 to 0.5 ms of CPU time on a 1 MB
+  search; with 64 KB (16 pages, the cost per page scaled) about a third of that.
+- **Waiting on shared engines** doubled the time of a small search (p50 0.12 to 0.25 ms,
+  `-c needle_zz` on 8 MB, 4 callers): the pool threads are already running. Not done there.
+
 ## Second round: CPU levels, the writer, the shared engine
 
 **Portable builds.** `zig build -Dcpu=baseline` (x86-64 without AVX2) used to give a binary

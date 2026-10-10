@@ -242,9 +242,21 @@ What the shared engine adds over running one-shot searches side by side:
   written from the mapping (or the chunk's `pread` buffer) instead of being copied.
 - **Threads** (searches without `-j`; on a shared engine, the pool threads a search lets
   in): started as they pay off, after the
-  bandwidth-aware threading of Suleman et al. (ASPLOS 2008). Up to one per physical core
-  they start without measuring (with `-m`, from the caller alone, doubling as chunks get
-  done, since such searches often stop early; small files get fewer). The second thread of
+  bandwidth-aware threading of Suleman et al. (ASPLOS 2008). A one-shot search starts on the
+  caller alone, and a thread it starts times starting a thread on this machine at this moment
+  (an idle core takes 70 to 320 us to run its first instruction, a busy one 22 to 73 us, and
+  a thread's first buffer costs 100 to 290 us more). After the first chunk the caller knows how
+  long the rest takes on one thread, W, and starts the n threads that finish soonest after
+  T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, L the latency of a thread and s the time spent
+  on starting and joining it, none if one thread is faster (2 threads win when W > L + 2s).
+  This takes the place of a file size threshold, which would be right warm and wrong cold
+  (a 2 MB file: 3.1 ms on one thread and 3.5 ms on 8 after the cores were idle, 1.55 and 1.24
+  just after they were busy): on a Ryzen 7735U 4 to 32 MB files take 7 to 24 % less time and
+  up to half the CPU time of one thread per core at once; files from 32 MB on pay 3 to 5 % for
+  the wait. With `-m` the search starts on the caller alone and
+  doubles as chunks get done, since it often stops early; on a shared engine the pool threads
+  are already running, so a search starts one per core (fewer for small files) without
+  timing. The second thread of
   each core starts only if the search has compute to overlap: when at least half of the time
   of the chunks read with `pread` goes to scanning and rendering rather than to the copy from
   the page cache. Otherwise the extra threads would only compete for memory bandwidth: a

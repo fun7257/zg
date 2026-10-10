@@ -657,6 +657,8 @@ const Job = struct {
     /// Time `pread` chunks spent reading, and working on what they read (for `Ramp`).
     read_ns: std.atomic.Value(u64) = .init(0),
     work_ns: std.atomic.Value(u64) = .init(0),
+    /// Time chunks of any access method took, waiting for the writer excluded (for `Ramp`).
+    chunk_ns: std.atomic.Value(u64) = .init(0),
 
     fn takeBuffer(job: *Job) std.ArrayList(u8) {
         job.bufs.acquire(job.std_io);
@@ -795,6 +797,10 @@ const Job = struct {
         while (job.workOne(&sc, true)) {}
     }
 
+    fn nowNs(job: *const Job) u64 {
+        return @intCast(@max(0, Io.Timestamp.now(job.std_io, .awake).nanoseconds));
+    }
+
     /// Claims and processes the next chunk of the current phase; false when none is left.
     /// With `block` false it also returns false, without claiming, while the memory budget
     /// forbids taking on more work (the writer calls it that way, it has to keep writing).
@@ -889,6 +895,7 @@ const Job = struct {
         defer {
             const ns: u64 = @intCast(@max(0, t0.durationTo(Io.Timestamp.now(job.std_io, .awake)).nanoseconds));
             job.access.record(&sc.streak, access, ns -| sc.waited, hi - lo);
+            if (job.ramp != null) _ = job.chunk_ns.fetchAdd(ns -| sc.waited, .monotonic);
             if (access == .read and job.ramp != null) {
                 _ = job.read_ns.fetchAdd(read_ns, .monotonic);
                 _ = job.work_ns.fetchAdd(ns -| sc.waited -| read_ns, .monotonic);
@@ -2210,6 +2217,10 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
         return 0;
     }
 
+    // A one-shot search that has chunks to share times starting a thread, while it sets itself up.
+    const calib: ?*StartCost = if (kind == .oneshot and opts.threads == 0 and opts.max_matches == 0 and size >= 2 * min_chunk) StartCost.begin(io) else null;
+    defer if (calib) |c| c.release();
+
     // Shared engines, `auto`: below `Pool.chunk_choice_class` the method comes from what
     // earlier searches took; the time of this one (to after the unmapping) is learned.
     const planned: ?Pool.Plan = if (kind == .shared) (if (opts.io == .auto and file != null) pool.plan(Pool.sizeClass(size)) else null) else null;
@@ -2347,7 +2358,9 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
             const handles = try gpa.alloc(std.Thread, nthreads - 1);
             defer gpa.free(handles);
             // A thread count asked for is used as is.
-            var ramp: Ramp = .init(handles, nthreads, physicalCores(io), opts.threads != 0);
+            var ramp: Ramp = .init(handles, nthreads, physicalCores(io), opts.threads != 0, calib != null);
+            ramp.calib = calib;
+            ramp.chunk_bytes = chunk_size;
             if (ramp.state != .done) job.ramp = &ramp;
             ramp.start(&job, ramp.initial(nchunks, opts.max_matches));
             if (opts.count_only) try runPhase(&job, &ramp) else try runStreaming(&job, &ramp, w);
@@ -2357,7 +2370,7 @@ fn searchFile(comptime kind: Kind, io: Io, gpa: std.mem.Allocator, pool: if (kin
             // The pool's threads join as the search pays for them, as in a one-shot search
             // (`Ramp`): bandwidth-bound searches leave the second thread of each core to the
             // others. A thread count asked for is used as is.
-            var ramp: Ramp = .init(&.{}, nthreads, physicalCores(io), opts.threads != 0);
+            var ramp: Ramp = .init(&.{}, nthreads, physicalCores(io), opts.threads != 0, false);
             ramp.pool = pool;
             if (ramp.state != .done) job.ramp = &ramp;
             ramp.start(&job, ramp.initial(nchunks, opts.max_matches));
@@ -2453,11 +2466,138 @@ fn runStreaming(job: *Job, ramp: *Ramp, w: *Io.Writer) !void {
 ///     -c needle_zz 24.3 / 26.4   ERROR 21.2 / 24.5   long.txt th 23.2 / 42.3
 ///     the 41.1 / 32.6            -n a 67.3 / 47.8    -c the 30.4 / 25.4
 ///
-/// The threads are started in two parts. Up to one per core they are not measured, only
-/// paced: too few threads cost far more than too many (2x on compute-bound searches,
-/// against CPU time on bandwidth-bound ones). A search with `-m` starts on the caller alone
-/// and doubles its threads each time every thread has done a chunk, since it often stops
-/// early; others start on one thread per core, fewer for small files (8 chunks each).
+/// The costs measured on a lone thread are lower bounds of what the helpers of a search pay:
+/// they also contend for the kernel's locks while they get their buffers, find the file cold
+/// in their caches, and are joined at the end. Fitting the model below to the gains observed
+/// with 2 and 4 threads gave a latency 2.6 times and a per-thread cost 1.9 to 3.3 times the
+/// measured ones, warm and cold alike (L 0.31 against 0.12 ms and s 0.134 against 0.041 ms
+/// warm; 0.94 against 0.36 and 0.20 against 0.105 cold).
+const start_cost_factor = 2.5;
+
+/// The thread count that finishes `work_ns` (the rest of a search on one thread) soonest, the
+/// caller included; one if no more threads win. A thread asked for now does its first chunk
+/// `latency_ns` later, the caller spends `spawn_ns` on starting (and later joining) each of
+/// them, the later ones starting later, and the work is shared as chunks, so n threads finish
+/// after T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, against W on one. Two threads win when
+/// W > L + 2s, and the least T is at about n = sqrt(2 (W-L-s) / s). The costs are those
+/// measured (`StartCost`) times `start_cost_factor`.
+fn threadsForWork(work_ns: u64, latency_ns: u64, spawn_ns: u64, cores: u32) u32 {
+    const w: f64 = @floatFromInt(work_ns);
+    const l: f64 = start_cost_factor * @as(f64, @floatFromInt(latency_ns));
+    const s: f64 = start_cost_factor * @as(f64, @floatFromInt(@max(1000, spawn_ns)));
+    var best: u32 = 1;
+    var best_t = w;
+    var n: u32 = 2;
+    while (n <= cores) : (n += 1) {
+        const nf: f64 = @floatFromInt(n);
+        const t = (w + (nf - 1) * (l + s) + s * nf * (nf - 1) / 2) / nf;
+        if (t < best_t) {
+            best_t = t;
+            best = n;
+        }
+    }
+    return best;
+}
+
+/// What starting a thread costs here and now, measured by a thread that does nothing else
+/// (`begin` at the start of a one-shot search, so that the thread starts while the search sets
+/// itself up). It writes into a slot of its own and never touches the search, so the search
+/// does not wait for it, not even when it has not started yet: it is detached. The cost is
+/// not a constant of the machine: a core that has been idle takes tens to hundreds of
+/// microseconds to run its first instruction, one that was just busy a few.
+const StartCost = struct {
+    /// 0 free, otherwise the owners left: the search and the thread.
+    refs: std.atomic.Value(u32) = .init(0),
+    /// 0 until the thread has measured, then 1.
+    done: std.atomic.Value(u32) = .init(0),
+    /// When the caller began to start the thread (`awake` clock, ns), and what the call took.
+    begin_ns: u64 = 0,
+    spawn_ns: u64 = 0,
+    /// When the thread ran its first instruction, and the time per byte of getting a buffer
+    /// and touching every page of it (what a thread's first chunk has to do before it can start).
+    run_ns: std.atomic.Value(u64) = .init(0),
+    buffer_ns_per_kb: std.atomic.Value(u64) = .init(0),
+
+    var slots: [16]StartCost = @splat(.{});
+
+    /// Starts the measuring thread; null when there is no free slot or no thread.
+    fn begin(io: Io) ?*StartCost {
+        for (&slots) |*c| {
+            if (c.refs.cmpxchgStrong(0, 2, .acquire, .monotonic) != null) continue;
+            c.done.store(0, .monotonic);
+            c.run_ns.store(0, .monotonic);
+            c.begin_ns = nowNs(io);
+            const t = std.Thread.spawn(.{}, measure, .{ c, io }) catch {
+                c.refs.store(0, .release);
+                return null;
+            };
+            c.spawn_ns = nowNs(io) - c.begin_ns;
+            t.detach();
+            return c;
+        }
+        return null;
+    }
+
+    fn measure(c: *StartCost, io: Io) void {
+        c.run_ns.store(nowNs(io), .release);
+        const bytes = 64 * 1024; // sixteen pages: the cost per page is what is wanted
+        const t0 = nowNs(io);
+        if (std.heap.page_allocator.alloc(u8, bytes)) |buf| {
+            var i: usize = 0;
+            while (i < buf.len) : (i += 4096) buf[i] = 1;
+            std.mem.doNotOptimizeAway(buf.ptr);
+            std.heap.page_allocator.free(buf);
+        } else |_| {}
+        c.buffer_ns_per_kb.store((nowNs(io) - t0) / (bytes / 1024), .monotonic);
+        c.done.store(1, .release);
+        c.release();
+    }
+
+    fn release(c: *StartCost) void {
+        if (c.refs.fetchSub(1, .acq_rel) == 1) c.refs.store(0, .release);
+    }
+
+    /// The time from asking for a thread to the end of the buffer work of its first chunk.
+    fn latencyNs(c: *const StartCost, chunk_bytes: usize) u64 {
+        const ran = c.run_ns.load(.acquire);
+        return (ran -| c.begin_ns) + c.buffer_ns_per_kb.load(.monotonic) * (chunk_bytes / 1024);
+    }
+};
+
+fn nowNs(io: Io) u64 {
+    return @intCast(@max(0, Io.Timestamp.now(io, .awake).nanoseconds));
+}
+
+/// How many threads a one-shot search starts follows from what starting threads costs, measured
+/// on this machine at this moment (`StartCost`), and from how long the search takes on one thread
+/// (`threadsForWork`), not from a file size: a search starts on the caller alone, a thread
+/// started by the search itself times starting a thread, and after the first chunk (W: the rest
+/// on one thread, from the chunks done) the caller starts the n threads that finish soonest,
+/// none if that is one. The model, T(n) = [W + (n-1)(L+s) + s n (n-1)/2] / n, was checked
+/// against the gains of 2, 4 and 8 threads on 2 to 16 MB files, warm (cores busy just before)
+/// and cold (idle for 0.3 s): with the costs fitted it follows the observed gain of 2 threads
+/// within 5 to 10 % (4 MB `-c the` 0.61 ms observed, 0.65 predicted; 16 MB 2.51 and 2.66),
+/// and it has the signs right where threads lose (2 MB `-c needle_zz` cold: -0.14 ms
+/// observed with 2 threads, 0.00 predicted). Where it is too hopeful is the bandwidth: 16 MB
+/// `-c needle_zz` (one thread 9.7 GB/s) gains 1.0, 1.4, 1.2 ms with 2, 4, 8 threads, saturated
+/// at about 4 threads where the memory delivers about 33 GB/s, while `-c the` (3.5 GB/s per
+/// thread) still gains at 8; the second thread of each core is decided below, and one per core
+/// at most. The cost of a thread is not a constant: after an idle spell the first
+/// instruction of a thread comes 70 to 320 us after asking for it, 22 to 73 us when the cores
+/// were just busy, and getting its first chunk's buffer costs 100 to 290 us more. Measured on
+/// a Ryzen 7735U (8 cores, 16 hardware threads), cached words.txt prefixes, geometric mean over
+/// `-c needle_zz`, `-c the` and `the` (lines) of the wall time, builds alternating in rotating
+/// order, against a thread per core at once (the ramp's start before this): warm 4 to 32 MB
+/// 7 to 24 % less time, 1 to 2 MB the time of one thread; cold the same as fixed ranges of
+/// file size (one thread under 4 MiB, a thread per core from 32 MiB) fitted warm, at
+/// +-4 %. Files from 32 MB on pay the wait for the first chunk and the measurement before the
+/// threads start, 0.2 to 0.35 ms: 3 to 5 % on 32 to 128 MB, 0.7 % on 515 MB (the 39 standard
+/// cells 0.996x).
+/// A search with `-m` starts on the caller alone and doubles its threads each time every
+/// thread has done a chunk, since it often stops early. A shared engine does not time
+/// anything: its threads are already running, and a wait doubled the time of a small search
+/// (p50 0.12 to 0.25 ms, `-c needle_zz` on 8 MB, 4 callers); it starts one thread per core,
+/// fewer for small files (8 chunks each), and paces.
 ///
 /// The second thread per core is the step that pays or not, and it is decided the way
 /// bandwidth-aware threading decides (Suleman et al., ASPLOS 2008): by whether the work is
@@ -2485,7 +2625,10 @@ const Ramp = struct {
     max: u32,
     /// One thread per physical core (`physicalCores`), at most `max`.
     cores: u32,
-    state: enum { pace, settle, measure, done },
+    state: enum { probe, pace, settle, measure, done },
+    /// The measurement of what starting a thread costs (`probe`), and the chunk size it is for.
+    calib: ?*StartCost = null,
+    chunk_bytes: usize = 0,
     /// `job.done_chunks` when the current phase started; read and work times when the
     /// measurement started.
     mark_chunks: u32 = 0,
@@ -2502,22 +2645,23 @@ const Ramp = struct {
     /// buffers, access methods tried), and in it.
     const settle_per_thread = 2;
     const measure_per_thread = 4;
-
-    /// A ramp over `max` threads in all, adaptive unless `fixed`.
-    fn init(handles: []std.Thread, max: usize, cores: usize, fixed: bool) Ramp {
+    /// A ramp over `max` threads in all, adaptive unless `fixed`; it probes (`step`) if `probe`
+    /// and paces otherwise.
+    fn init(handles: []std.Thread, max: usize, cores: usize, fixed: bool, probe: bool) Ramp {
         return .{
             .handles = handles,
             .max = @intCast(max),
             .cores = @intCast(std.math.clamp(cores, 1, max)),
-            .state = if (fixed or max == 1) .done else .pace,
+            .state = if (fixed or max == 1) .done else if (probe) .probe else .pace,
         };
     }
 
-    /// The threads to start with: all of them for a fixed count; the caller alone with
-    /// `-m`; otherwise one per core, fewer for small files (8 chunks each at least).
+    /// The threads to start with: all of them for a fixed count. When probing: the caller
+    /// alone. When pacing: the caller alone with `-m`, otherwise one per core, fewer for small
+    /// files (8 chunks each at least).
     fn initial(r: *const Ramp, nchunks: usize, max_matches: usize) u32 {
         if (r.state == .done) return r.max;
-        if (max_matches != 0) return 1;
+        if (r.state == .probe or max_matches != 0) return 1;
         return @intCast(@max(1, @min(r.cores, nchunks / 8)));
     }
 
@@ -2554,6 +2698,28 @@ const Ramp = struct {
         }
         const done = job.done_chunks.load(.acquire);
         switch (r.state) {
+            .probe => {
+                // Nothing is decided until the thread that times starting a thread has
+                // reported; the caller works on alone meanwhile, which is what a thread
+                // that is slow to start would have left it to do anyway.
+                const c = r.calib.?;
+                if (c.done.load(.acquire) == 0 or done < 1) return;
+                if (job.nchunks - next < 2) {
+                    r.state = .done;
+                    return;
+                }
+                const per_chunk = job.chunk_ns.load(.monotonic) / done;
+                const best = threadsForWork(per_chunk * (job.nchunks - next), c.latencyNs(r.chunk_bytes), 2 * c.spawn_ns, r.cores);
+                if (best > r.active) r.spawnUpTo(job, best);
+                if (r.active < r.cores) {
+                    r.state = .done;
+                    return;
+                }
+                // One thread per core: the second thread of each is for `pace` to decide, which
+                // need not wait for a round of chunks first.
+                r.mark_chunks = done -% r.active;
+                r.state = .pace;
+            },
             .pace => {
                 if (done -% r.mark_chunks < r.active) return;
                 if (r.active < r.cores) {
@@ -2562,8 +2728,7 @@ const Ramp = struct {
                 } else if (r.active == r.max) {
                     r.state = .done;
                 } else if (job.nchunks - next < 2 * (settle_per_thread + measure_per_thread) * r.active) {
-                    // Too short to measure: all threads.
-                    r.spawnUpTo(job, r.max);
+                    // Too short to measure the second thread of each core: one per core.
                     r.state = .done;
                 } else {
                     r.mark_chunks = done;
@@ -3113,6 +3278,43 @@ test "lines around the zero-copy threshold keep their order and content" {
             try expectMatchesReference(data.items, .{ .pattern = "xa", .line_numbers = numbered, .io = io_choice, .threads = 3, .chunk_size = chunk });
         }
     };
+}
+
+test "threadsForWork: one thread below the break-even, the cores for long searches" {
+    const l: u64 = 120_000;
+    const sp: u64 = 20_000; // 2 * spawn in StartCost is 40 us; the call is 20 us
+    const f = start_cost_factor;
+    const be: u64 = @intFromFloat(f * (@as(f64, @floatFromInt(l)) + 2 * @as(f64, @floatFromInt(2 * sp))));
+    try testing.expectEqual(@as(u32, 1), threadsForWork(be - be / 20, l, 2 * sp, 8));
+    try testing.expect(threadsForWork(be + be / 5, l, 2 * sp, 8) >= 2);
+    try testing.expectEqual(@as(u32, 1), threadsForWork(0, l, 2 * sp, 8));
+    try testing.expectEqual(@as(u32, 8), threadsForWork(100_000_000, l, 2 * sp, 8));
+    try testing.expectEqual(@as(u32, 1), threadsForWork(100_000_000, l, 2 * sp, 1));
+    // More work never starts fewer threads; costlier threads never start more.
+    var prev: u32 = 1;
+    var w: u64 = 10_000;
+    while (w < 50_000_000) : (w += w / 3 + 1) {
+        const n = threadsForWork(w, l, 2 * sp, 16);
+        try testing.expect(n >= prev);
+        try testing.expect(threadsForWork(w, 4 * l, 8 * sp, 16) <= n);
+        prev = n;
+    }
+}
+
+test "Ramp: a one-shot search starts on the caller alone, others as they did" {
+    var fixed: Ramp = .init(&.{}, 16, 8, true, true);
+    try testing.expectEqual(@as(u32, 16), fixed.initial(4, 0));
+    var probing: Ramp = .init(&.{}, 16, 8, false, true);
+    try testing.expectEqual(@as(u32, 1), probing.initial(2048, 0));
+    try testing.expect(probing.state == .probe);
+    var limited: Ramp = .init(&.{}, 16, 8, false, false); // -m, or a shared engine
+    try testing.expectEqual(@as(u32, 1), limited.initial(2048, 5));
+    var large: Ramp = .init(&.{}, 16, 8, false, false);
+    try testing.expectEqual(@as(u32, 8), large.initial(2048, 0));
+    var small: Ramp = .init(&.{}, 16, 8, false, false);
+    try testing.expectEqual(@as(u32, 2), small.initial(16, 0)); // 8 chunks per thread
+    var single: Ramp = .init(&.{}, 1, 1, false, true);
+    try testing.expectEqual(@as(u32, 1), single.initial(2048, 0));
 }
 
 test "AccessStats tries every allowed method, then keeps the fastest, with either policy" {

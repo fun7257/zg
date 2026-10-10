@@ -6,13 +6,13 @@ const builtin = @import("builtin");
 /// registers; 32 maps to one AVX2 register. On SSE2, 32-byte vectors are split in two and the
 /// lane masks put back together, which cost twice the time: one thread, `-c needle_zz` on a
 /// 540 MB cached file, 154 ms with 32 and 74 ms with 16 (68 ms with AVX2).
-pub const vec_len = if (builtin.cpu.arch.isAARCH64() or (builtin.cpu.arch == .x86_64 and !std.Target.x86.featureSetHas(builtin.cpu.features, .avx2))) 16 else 32;
+pub const vec_len = if (builtin.target.cpu.arch.isAARCH64() or (builtin.target.cpu.arch == .x86_64 and !std.Target.x86.featureSetHas(builtin.target.cpu.features, .avx2))) 16 else 32;
 const Vec = @Vector(vec_len, u8);
-const neon = builtin.cpu.arch.isAARCH64();
+const neon = builtin.target.cpu.arch.isAARCH64();
 
 /// Bitmask of lane hits. x86 uses one bit per lane (movemask); NEON has no
 /// movemask, so lanes are narrowed to one nibble each (the `shrn` trick).
-const Mask = if (neon) u64 else std.meta.Int(.unsigned, vec_len);
+const Mask = if (neon) u64 else @Int(.unsigned, vec_len);
 const bits_per_lane = if (neon) 4 else 1;
 const lane_bits: Mask = if (neon) 0x1111_1111_1111_1111 else std.math.maxInt(Mask);
 
@@ -311,7 +311,7 @@ pub const Searcher = struct {
         const n = s.needle;
         const span = sample.len - n.len + 1;
         const lanes = 32;
-        const Bits = std.meta.Int(.unsigned, lanes);
+        const Bits = @Int(.unsigned, lanes);
         var hits: usize = 0;
         var i: usize = 0;
         while (i + lanes <= span) : (i += lanes) {

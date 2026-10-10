@@ -23,5 +23,5 @@ zg --version
 | `zg-VERSION-aarch64-linux.tar.gz` | Linux on arm64 (ARMv8-A with NEON), static. |
 | `zg-VERSION-aarch64-macos.tar.gz` | macOS on Apple Silicon (M1 and later). Not notarized: if it was downloaded with a browser and macOS refuses to open it, run `xattr -d com.apple.quarantine zg` once (a download with `curl` is not affected). |
 
-Not built: Windows, and macOS on Intel. To build for another system: `zig build -Doptimize=ReleaseFast`
-with Zig 0.16 (see the README).
+Not built: Windows, and macOS on Intel. To build for another system: `zig build -Doptimize=fast`
+with Zig 0.17 (see the README).

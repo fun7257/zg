@@ -14,7 +14,7 @@ const builtin = @import("builtin");
 /// As in the command line tool (src/main.zig): no alternate signal stack per thread
 /// outside Debug builds, which makes starting a thread several times cheaper.
 pub const std_options: std.Options = .{
-    .signal_stack_size = if (builtin.mode == .Debug) 1 << 18 else null,
+    .signal_stack_size = if (builtin.mode == .debug) 1 << 18 else null,
 };
 const Io = std.Io;
 const zg = @import("zg");
@@ -178,7 +178,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\n2. 4 callers x {d} searches of `-c needle_zz` on {s}, alone and next to `the` (all lines) on {s} ({d} heavy searches meanwhile)\n", .{ small_rounds, paths[1], paths[0], heavy_lat.len });
     std.debug.print("| small searches | p50 ms | p99 ms | max ms |\n|---|---|---|---|\n| alone | {d:.2} | {d:.2} | {d:.2} |\n| next to the heavy search | {d:.2} | {d:.2} | {d:.2} |\n", .{ a.p50, a.p99, a.max, m.p50, m.p99, m.max });
 
-    if (@import("builtin").os.tag.isDarwin()) {
+    if (@import("builtin").target.os.tag.isDarwin()) {
         std.debug.print("\npeak of the memory zg allocated (anonymous, without mapped file pages): {d:.0} MB\n", .{anonymousPeak() / (1 << 20)});
     } else {
         const ru = std.posix.getrusage(0);

@@ -2,7 +2,7 @@
 
 [English](README.md) · [![CI](https://github.com/fun7257/zg/actions/workflows/ci.yml/badge.svg)](https://github.com/fun7257/zg/actions/workflows/ci.yml)
 
-用 Zig 0.16 写的单文件、按行、字面量快速搜索工具：块内用 SIMD，块之间用满所有核。提供命令行工具，也可以作为库嵌入服务。
+用 Zig 0.17 写的单文件、按行、字面量快速搜索工具：块内用 SIMD，块之间用满所有核。提供命令行工具，也可以作为库嵌入服务。
 
 ```
 $ zg -n ERROR app.log
@@ -56,13 +56,13 @@ macOS 的程序没有经过公证：如果是用浏览器下载的，macOS 拒�
 
 ## 构建
 
-需要 [Zig 0.16.0](https://ziglang.org/download/)。
+需要 [Zig 0.17.0](https://ziglang.org/download/)。
 
 ```
 zig build                  # 生成 zig-out/bin/zg 和基准工具，ReleaseFast，按本机 CPU 编译
-zig build install          # 只安装 zg，到 ~/.local/bin（用 -Dbin-dir=PATH 指定别处）
+zig build install          # 只安装 zg，到 zig-out/bin（用 --prefix-exe-dir ~/.local/bin 指定别处）
 zig build -Dcpu=baseline   # 可移植的 x86-64 二进制（见下）
-zig build test             # 运行测试，ReleaseSafe（加 -Dtest-optimize=Debug 用 Debug）
+zig build test             # 运行测试，ReleaseSafe（加 -Dtest-optimize=debug 用 Debug）
 zig build test-levels      # 按本机支持的每个 x86-64 级别（v1、v2、v3）各跑一遍测试
 ```
 

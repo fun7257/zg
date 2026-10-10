@@ -2,7 +2,7 @@
 
 [中文说明](README.zh-CN.md) · [![CI](https://github.com/fun7257/zg/actions/workflows/ci.yml/badge.svg)](https://github.com/fun7257/zg/actions/workflows/ci.yml)
 
-A fast, line-oriented literal search for one file, written in Zig 0.16. It uses SIMD within
+A fast, line-oriented literal search for one file, written in Zig 0.17. It uses SIMD within
 chunks of the file and every core across them, and comes as a command line tool and as a
 library that a server can embed.
 
@@ -81,13 +81,13 @@ The macOS binary is not notarized: if macOS refuses to open one downloaded with 
 
 ## Building
 
-Requires [Zig 0.16.0](https://ziglang.org/download/).
+Requires [Zig 0.17.0](https://ziglang.org/download/).
 
 ```
 zig build                  # zig-out/bin/zg and the benchmark tools, ReleaseFast, for this machine's CPU
-zig build install          # install only zg, into ~/.local/bin (-Dbin-dir=PATH for elsewhere)
+zig build install          # install only zg, into zig-out/bin (--prefix-exe-dir ~/.local/bin for elsewhere)
 zig build -Dcpu=baseline   # a portable x86-64 binary (see below)
-zig build test             # tests, in ReleaseSafe (-Dtest-optimize=Debug for Debug)
+zig build test             # tests, in ReleaseSafe (-Dtest-optimize=debug for Debug)
 zig build test-levels      # the tests once per x86-64 level (v1, v2, v3) the machine runs
 ```
 

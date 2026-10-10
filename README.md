@@ -256,8 +256,8 @@ What the shared engine adds over running one-shot searches side by side:
   This takes the place of a file size threshold, which would be right warm and wrong cold
   (a 2 MB file: 3.1 ms on one thread and 3.5 ms on 8 after the cores were idle, 1.55 and 1.24
   just after they were busy): on a Ryzen 7735U 4 to 32 MB files take 7 to 24 % less time and
-  up to half the CPU time of one thread per core at once; files from 32 MB on pay 3 to 5 % for
-  the wait. With `-m` the search starts on the caller alone and
+  up to half the CPU time of one thread per core at once; files from 32 MB on pay 0 to 3 % for
+  the wait (the first chunk is a quarter of a chunk, to decide sooner). With `-m` the search starts on the caller alone and
   doubles as chunks get done, since it often stops early; on a shared engine the pool threads
   are already running, so a search starts one per core (fewer for small files) without
   timing. The second thread of

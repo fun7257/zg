@@ -492,6 +492,25 @@ chunk, which takes about 0.3 to 0.4 ms of a 1 MB chunk on the arm64 runner (a 25
 x86-64: 0.05 to 0.1 ms), and after the measuring thread has reported (60 to 250 us): a fixed
 0.3 to 0.5 ms that is 3 to 10 % of a search of 5 to 10 ms and 0.5 % of one of 100 ms.
 
+**A short first chunk.** The decision comes after the first chunk, whose time grows with the
+chunk (256 KB on x86-64, 1 MB on the arm64 runner, 2 MB on the Mac), so the wait did. The first
+chunk is now a quarter of a chunk, page-aligned, and the others follow from where it ends
+(`firstChunkLen`, `chunkLo`); the work left is estimated from the time per byte. Default against
+all threads at once, wall time ratio (below 1 the default is faster), on the hosted runners
+(warm / cold), whole first chunk, then a quarter:
+
+| size | x86-64 | arm64 | macOS (noisy) |
+|---|---|---|---|
+| 4 MB | 0.99 / 0.96 then 0.98 / 0.96 | 1.12 / 1.10 then 1.04 / 1.03 | 1.19 / 1.04 then 1.08 / 0.90 |
+| 16 MB | 1.02 / 1.01 then 1.04 / 1.00 | 1.07 / 1.07 then 1.04 / 1.02 | 1.12 / 0.97 then 0.96 / 0.88 |
+| 64 MB | 1.05 / 0.99 then 1.02 / 1.02 | 1.07 / 1.06 then 1.02 / 1.02 | 1.08 / 1.01 then 1.04 / 0.99 |
+
+On the Ryzen (warm, geometric mean, against the previous commit and against a thread per core
+at once): 32 MB 4.42 ms against 4.60 and 4.34, 64 MB 5.75 against 6.00 and 5.67, 128 MB 7.97
+against 8.27 and 8.02, 515 MB 20.70 against 21.28 and 20.70. Cold cores the same; the 39 standard
+cells 0.994x, 1.004x and 0.997x in three runs. The thread count against one thread is as before
+(8 MB: x86-64 0.76 to 0.68, arm64 0.65 to 0.61 of the time of one thread).
+
 What was tried on the way:
 
 - **A first table that was wrong.** Thread count against file size, each setting run in a

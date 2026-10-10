@@ -2644,8 +2644,10 @@ fn nowNs(io: Io) u64 {
 /// 7 to 24 % less time, 1 to 2 MB the time of one thread; cold the same as fixed ranges of
 /// file size (one thread under 4 MiB, a thread per core from 32 MiB) fitted warm, at
 /// +-4 %. Files from 32 MB on pay the wait for the first chunk and the measurement before the
-/// threads start, 0.2 to 0.35 ms: 3 to 5 % on 32 to 128 MB, 0.7 % on 515 MB (the 39 standard
-/// cells 0.996x).
+/// threads start; the first chunk is cut to a quarter of a chunk for that (`firstChunkLen`), and
+/// they then are 0 to 2 % behind threads started at once on the Ryzen (32 MB +2 %, 64 MB +1 %,
+/// 128 and 515 MB 0 %; it was 3 to 5 %), 2 to 3 % on the hosted x86-64 and arm64 runners (arm64
+/// 7 to 12 % with whole chunks of 1 MB), the 39 standard cells 0.994x to 1.004x.
 /// A search with `-m` starts on the caller alone and doubles its threads each time every
 /// thread has done a chunk, since it often stops early. A shared engine does not time
 /// anything: its threads are already running, and a wait doubled the time of a small search

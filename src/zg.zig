@@ -3493,6 +3493,27 @@ test "AccessStats tries every allowed method, then keeps the fastest, with eithe
     }
 }
 
+/// The searches have returned their memory, apart from the buffers an idle pool thread
+/// keeps (`retain`). That thread trims after the last search returns (`Pool.work`), so
+/// the check waits for it. `testing.expect` prints nothing on failure: the x86-64 v1
+/// `test-levels` job on a GitHub runner (2026-10-12) reported this test failed with an
+/// empty stderr. The v2 and v3 builds in that job passed the same test.
+fn expectIdle(pool: *Pool) !void {
+    try testing.expectEqual(@as(usize, 0), pool.mem.queued.load(.monotonic));
+    pool.wake();
+    const start = Io.Timestamp.now(testing.io, .awake);
+    while (pool.mem.pool_bytes.load(.monotonic) > pool.retain) {
+        if (start.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds > std.time.ns_per_s) {
+            std.debug.print("shared engine kept {d} bytes of buffers, retain is {d}\n", .{
+                pool.mem.pool_bytes.load(.monotonic),
+                pool.retain,
+            });
+            return error.TestExpectedEqual;
+        }
+        std.atomic.spinLoopHint();
+    }
+}
+
 test "a shared engine runs concurrent searches, each with the reference output" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -3561,9 +3582,7 @@ test "a shared engine runs concurrent searches, each with the reference output" 
         }
         for (callers) |t| t.join();
         try testing.expect(!failed.load(.monotonic));
-        // Every search gave its memory back, but for the buffers the engine keeps.
-        try testing.expectEqual(@as(usize, 0), engine.pool.mem.queued.load(.monotonic));
-        try testing.expect(engine.pool.mem.pool_bytes.load(.monotonic) <= engine.pool.retain);
+        try expectIdle(engine.pool);
     }
 }
 
@@ -3651,8 +3670,7 @@ test "a search can be canceled or time out, before or while it runs" {
         try testing.expectError(error.Canceled, engine.search(.{ .file = file }, .{ .pattern = "a", .count_only = true, .cancel = &early }, &w1.w));
     }
     // The stopped searches gave their memory back, but for the buffers the engine keeps.
-    try testing.expectEqual(@as(usize, 0), shared.pool.mem.queued.load(.monotonic));
-    try testing.expect(shared.pool.mem.pool_bytes.load(.monotonic) <= shared.pool.retain);
+    try expectIdle(shared.pool);
 }
 
 test "a slow reader does not hold up the other searches of a shared engine" {
@@ -3760,8 +3778,7 @@ test "a file truncated during a search never brings the process down" {
             try testing.expectEqualStrings(want, sw.out.written());
         } else |err| try testing.expectEqual(error.FileChanged, err);
     };
-    try testing.expectEqual(@as(usize, 0), engine.pool.mem.queued.load(.monotonic));
-    try testing.expect(engine.pool.mem.pool_bytes.load(.monotonic) <= engine.pool.retain);
+    try expectIdle(engine.pool);
 
     // The engine goes on working.
     const want = try expectedOutput(gpa, data, .{ .pattern = "c a", .line_numbers = true });

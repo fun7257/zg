@@ -118,6 +118,23 @@ pub fn build(b: *std.Build) void {
         b.step(name, b.fmt("Run bench/{s}.zig", .{name})).dependOn(&tool_run.step);
     }
 
+    // pread against io_uring, for the bandwidth ceiling. Linux only: the ring is a
+    // Linux syscall, and the source uses linux.pread / linux.IoUring directly.
+    if (target.result.os.tag == .linux) {
+        const uring = b.addExecutable(.{
+            .name = "uring",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("bench/uring.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        dev.dependOn(&b.addInstallArtifact(uring, .{ .dest_dir = .{ .override = dev_dir } }).step);
+        const uring_run = b.addRunArtifact(uring);
+        uring_run.addPassthruArgs();
+        b.step("uring", "pread vs io_uring bandwidth experiment").dependOn(&uring_run.step);
+    }
+
     // Tests keep runtime safety checks (overflow, bounds, ...) on, unlike the release binary.
     const test_optimize = b.option(std.lang.Optimize, "test-optimize", "Optimization mode for tests (default: safe)") orelse .safe;
     const tests = b.addTest(.{

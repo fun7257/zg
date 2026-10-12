@@ -10,12 +10,33 @@
 //! Three ceilings, measured apart because they are different pipes:
 //! - warm: the file is in the page cache. The limit is the copy out of it.
 //! - cold: `POSIX_FADV_DONTNEED` before each run. The limit is the SSD through the
-//!   page cache. Major faults and `ru_inblock` say whether the drop actually happened.
+//!   page cache. `ru_inblock` says whether the drop happened; `ru_majflt` did not move.
 //! - direct: `O_DIRECT`, so the drive's own ceiling, not the page cache.
 //!
 //! `scan` is the warm read plus a SIMD pass over every byte returned, the way a
 //! search has to touch what it read. io_uring can overlap that pass with reads that
 //! are still in flight; a synchronous `pread` cannot.
+//!
+//! Measured 2026-10-13 on the Ryzen 7 7735U and Samsung SSD 980 this tree's Linux
+//! numbers come from (2 GiB, median of 5 rounds, rows rotated). Full table in
+//! bench/uring-results.md.
+//!
+//! - Warm page cache, 8 threads, 256 KB or 1 MB, one buffer each: pread 34.3 GB/s.
+//!   The same shape over io_uring was 25.5 GB/s, and 8 threads at 1 MB with 16 in
+//!   flight fell to 11.5 GB/s. A deep queue of large buffers does not fit in L2,
+//!   so the copy destination misses to DRAM. One L2-sized buffer per thread is
+//!   the shape that fills the memory pipe, which is the shape zg already uses.
+//! - Cold, after POSIX_FADV_DONTNEED (`ru_inblock` was the whole file): one pread
+//!   thread 1.96 GB/s, one io_uring thread at queue depth 32 2.62 GB/s, and 4 or
+//!   8 threads of either about 2.65 GB/s. The ring gets one thread up to the
+//!   plateau the extra threads already reach. It does not raise the plateau.
+//! - O_DIRECT, one thread, 1 MB, queue depth 32 or 128: 3.16 GB/s, the drive's
+//!   rated 3100 MB/s. Several threads, pread or io_uring, sit at 2.7 GB/s.
+//!   IOPOLL returned EOPNOTSUPP. SQPOLL, DEFER_TASKRUN and registered buffers
+//!   (capped by an 8 MB memlock) did not move either ceiling.
+//!
+//! The warm search path is not an io_uring path. O_DIRECT is a different access
+//! method, and the cold buffered plateau does not move.
 //!
 //! Rounds rotate the order of the rows. A laptop's clocks follow the order of the
 //! runs, so one setting after another is not a comparison.

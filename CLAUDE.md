@@ -89,11 +89,14 @@ argument") and every run aborts.
   one setting after another**: a first table (each thread count in a block of its own) was wrong
   because the clock rate followed the order of the blocks.
 - **Vector width** is 16 bytes without AVX2 (SSE2, NEON), 32 with: 32 on SSE2 was twice as slow.
-- **Linux specifics**, each measured (see results-x86-linux.md): `pread` from page boundaries (a
-  copy offset by a byte is 3-6x slower); chunk size is at most a thread's share of L2, read from
-  sysfs/sysctl; the mapped access methods are charged for unmapping (14 ms for 540 MB, serial);
-  shared engines read files above 256 MB with `pread` only (unmapping blocks the process's address
-  space lock for the other searches).
+- **Linux specifics**, each measured (see results-x86-linux.md): the `pread` access method is
+  `io_uring` (`IORING_OP_READ` on a per-worker ring in `Scratch`, depth one; falls back to
+  `pread` if setup fails); reads start at page boundaries (a copy offset by a byte is 3-6x
+  slower); chunk size is at most a thread's share of L2, read from sysfs/sysctl; the mapped
+  access methods are charged for unmapping (14 ms for 540 MB, serial); shared engines read
+  files above 256 MB with the positional path only (unmapping blocks the process's address
+  space lock for the other searches). `bench/uring.zig` compares queue depths and `O_DIRECT`
+  against that shape (`bench/uring-results.md`).
 - **Shared engine caches** (`MapCache`, `TuneCache`) are keyed by inode, size and mtime. A `BusGuard`
   hit marks every search on the mapping.
 - Nothing about a `Job` may be read after `inflight` is dropped (see above).

@@ -230,13 +230,15 @@ What the shared engine adds over running one-shot searches side by side:
   work is spread over the threads. `-n` line numbers come from newline counts gathered by
   the scan itself and published chunk by chunk, in order.
 - **Reading**: per chunk, through the mapping with `MADV_WILLNEED`, through the plain
-  mapping, or with `pread`. Which is fastest depends on the state of the system, not only on
-  whether the file is cached, so the threads time the methods on the file itself and keep
-  using the fastest, with regular re-checks. On Linux the mapped methods are also charged for
+  mapping, or with positional reads (`--io=pread`). Which is fastest depends on the state of
+  the system, not only on whether the file is cached, so the threads time the methods on the
+  file itself and keep using the fastest, with regular re-checks. On Linux those positional
+  reads are `io_uring` (`IORING_OP_READ` on a per-worker ring; depth one, one L2-sized buffer
+  per thread). Elsewhere they are `pread`. On Linux the mapped methods are also charged for
   unmapping their pages at the end, a serial cost the chunk timings do not see (14 ms for
-  540 MB), so cached files are mostly read with `pread` there, from page boundaries (a copy
-  between different offsets within a cache line is several times slower on x86). Small files
-  go by a sampled `mincore` instead.
+  540 MB), so cached files are mostly read with the positional path there, from page
+  boundaries (a copy between different offsets within a cache line is several times slower on
+  x86). Small files go by a sampled `mincore` instead.
 - **Output**: each chunk renders its lines into a buffer, and the writer writes the chunks in
   order as they complete, working on chunks itself meanwhile. Lines of 16 KB and more are
   written from the mapping (or the chunk's `pread` buffer) instead of being copied.

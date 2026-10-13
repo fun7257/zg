@@ -3,6 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const linux = std.os.linux;
 const search = @import("search.zig");
 
 pub const IoChoice = enum { auto, mmap, pread };
@@ -117,8 +118,9 @@ pub const Cancel = struct {
 // the chunks it covers, and no chunk ever needs more than its range in memory.
 
 /// How workers get at file contents. Page-cache-resident files are fastest through mmap;
-/// cold files are read about 1.7x faster with large sequential `pread`s, because
-/// page faults only trigger small readaheads.
+/// cold files are read about 1.7x faster with large sequential positional reads, because
+/// page faults only trigger small readaheads. The `pread` name is the access method
+/// (`--io=pread`); on Linux those reads are `io_uring` (`IORING_OP_READ`), elsewhere `pread`.
 const IoMode = enum { mmap, pread };
 
 /// How one chunk is accessed. Which is fastest depends on the state of the system's memory,
@@ -444,10 +446,40 @@ const Scratch = struct {
     streak: AccessStats.Streak = .{},
     /// Nanoseconds the current chunk spent waiting for earlier chunks (`firstLine`).
     waited: u64 = 0,
+    /// Linux: the worker's io_uring for `Access.read`. Created on the first read; closed
+    /// with the scratch so short-lived one-shot threads do not leak a ring fd.
+    ring: if (builtin.os.tag == .linux) ?linux.IoUring else void = if (builtin.os.tag == .linux) null else {},
+    /// Linux: io_uring setup failed; `readAt` uses `pread` for this worker.
+    ring_off: if (builtin.os.tag == .linux) bool else void = if (builtin.os.tag == .linux) false else {},
 
     fn deinit(sc: *Scratch, gpa: std.mem.Allocator) void {
+        if (comptime builtin.os.tag == .linux) {
+            if (sc.ring) |*r| r.deinit();
+            sc.ring = null;
+        }
         sc.read.deinit(gpa);
         sc.matches.deinit(gpa);
+    }
+
+    /// The worker's ring, or null when the kernel will not give one (then `readAt` falls
+    /// back to `pread`). Prefer single-issuer + deferred task run: this thread alone submits.
+    fn ringOrNull(sc: *Scratch) ?*linux.IoUring {
+        if (comptime builtin.os.tag != .linux) return null;
+        if (sc.ring_off) return null;
+        if (sc.ring == null) {
+            const prefer = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_DEFER_TASKRUN;
+            sc.ring = linux.IoUring.init(8, prefer) catch |err| switch (err) {
+                error.ArgumentsInvalid, error.SystemOutdated, error.PermissionDenied => linux.IoUring.init(8, 0) catch {
+                    sc.ring_off = true;
+                    return null;
+                },
+                else => {
+                    sc.ring_off = true;
+                    return null;
+                },
+            };
+        }
+        return &sc.ring.?;
     }
 };
 
@@ -930,7 +962,7 @@ const Job = struct {
             .map => job.data[v_lo..v_hi],
             .read => blk: {
                 sc.read.items.len = v_hi - r_lo; // capacity readied above
-                try readAt(job.std_io, job.file.?, sc.read.items, r_lo);
+                try readAt(job.std_io, job.file.?, sc.read.items, r_lo, sc);
                 read_ns = @intCast(@max(0, t0.durationTo(Io.Timestamp.now(job.std_io, .awake)).nanoseconds));
                 break :blk sc.read.items[v_lo - r_lo ..];
             },
@@ -1044,14 +1076,15 @@ const Job = struct {
     }
 
     /// Writes file bytes [a, b): from the mapping, or read in pieces while the mapping is
-    /// the slow way in (`AccessStats` found `pread` fastest).
-    fn writeRange(job: *Job, out: *Io.Writer, a: usize, b: usize) !void {
+    /// the slow way in (`AccessStats` found `pread` fastest). `sc` carries the writer's
+    /// io_uring on Linux.
+    fn writeRange(job: *Job, out: *Io.Writer, a: usize, b: usize, sc: ?*Scratch) !void {
         if (job.access.best() != .read) return out.writeAll(job.data[a..b]);
         var piece: [256 * 1024]u8 = undefined;
         var off = a;
         while (off < b) {
             const n = @min(b - off, piece.len);
-            try readAt(job.std_io, job.file.?, piece[0..n], off);
+            try readAt(job.std_io, job.file.?, piece[0..n], off, sc);
             try out.writeAll(piece[0..n]);
             off += n;
         }
@@ -1059,11 +1092,11 @@ const Job = struct {
 
     /// Writes the part of `piece` (file bytes from `start`) that lies in [pos, e), after
     /// any gap before it; returns the new position.
-    fn writePiece(job: *Job, out: *Io.Writer, piece: []const u8, start: usize, pos: usize, e: usize) !usize {
+    fn writePiece(job: *Job, out: *Io.Writer, piece: []const u8, start: usize, pos: usize, e: usize, sc: ?*Scratch) !usize {
         if (piece.len == 0) return pos;
         const pe = @min(start + piece.len, e);
         if (pe <= pos) return pos;
-        if (pos < start) try job.writeRange(out, pos, start);
+        if (pos < start) try job.writeRange(out, pos, start, sc);
         const from = @max(pos, start);
         try out.writeAll(piece[from - start .. pe - start]);
         return pe;
@@ -1098,12 +1131,12 @@ const Job = struct {
             try out.writeByte(':');
         }
         // The line from the pieces the `pread` chunks kept, the gaps from the file.
-        var pos = try job.writePiece(out, job.results[i].tail, pd.start, pd.start, e);
+        var pos = try job.writePiece(out, job.results[i].tail, pd.start, pd.start, e, sc);
         var k = i + 1;
         while (k <= last and k < job.nchunks) : (k += 1) {
-            pos = try job.writePiece(out, job.results[k].cont, job.chunkLo(k), pos, e);
+            pos = try job.writePiece(out, job.results[k].cont, job.chunkLo(k), pos, e, sc);
         }
-        if (pos < e) try job.writeRange(out, pos, e);
+        if (pos < e) try job.writeRange(out, pos, e, sc);
         try out.writeByte('\n');
     }
 
@@ -1361,10 +1394,61 @@ test "appendPrefix formats numbers" {
     }
 }
 
-/// Fills `dest` from file offset `offset` (positional read: threads share the file).
-fn readAt(io: Io, file: Io.File, dest: []u8, offset: usize) !void {
+/// Fills `dest` from file offset `offset` (positional: threads share the file). On Linux
+/// this is `IORING_OP_READ` on the worker's ring when `sc` has one (the `pread` access
+/// method); elsewhere, or when the ring cannot be created, it is `pread`. A short read
+/// means the file shrank.
+fn readAt(io: Io, file: Io.File, dest: []u8, offset: usize, sc: ?*Scratch) !void {
+    if (comptime builtin.os.tag == .linux) {
+        if (sc) |s| {
+            if (s.ringOrNull()) |ring| return readAtUring(ring, file.handle, dest, offset);
+        } else {
+            // Tune sample before any worker exists: a one-shot ring, or `pread` if setup fails.
+            var ring = linux.IoUring.init(8, 0) catch {
+                return readAtPread(io, file, dest, offset);
+            };
+            defer ring.deinit();
+            return readAtUring(&ring, file.handle, dest, offset);
+        }
+    }
+    return readAtPread(io, file, dest, offset);
+}
+
+fn readAtPread(io: Io, file: Io.File, dest: []u8, offset: usize) !void {
     const n = try file.readPositionalAll(io, dest, offset);
-    if (n != dest.len) return error.FileChanged; // the file shrank while we were reading it
+    if (n != dest.len) return error.FileChanged;
+}
+
+/// One positional read through `ring`, looping on short or interrupted completions until
+/// `dest` is full. Depth is one: zg's workers already keep one L2-sized buffer each, which
+/// is what fills the warm page-cache pipe (see `bench/uring-results.md`).
+fn readAtUring(ring: *linux.IoUring, fd: linux.fd_t, dest: []u8, offset: usize) !void {
+    var done: usize = 0;
+    while (done < dest.len) {
+        const buf = dest[done..];
+        _ = try ring.read(0, fd, .{ .buffer = buf }, offset + done);
+        while (true) {
+            _ = ring.submit() catch |err| switch (err) {
+                error.SignalInterrupt => continue,
+                else => return err,
+            };
+            break;
+        }
+        const cqe = blk: {
+            while (true) {
+                break :blk ring.copy_cqe() catch |err| switch (err) {
+                    error.SignalInterrupt => continue,
+                    else => return err,
+                };
+            }
+        };
+        if (cqe.res < 0) switch (cqe.err()) {
+            .INTR, .AGAIN => continue,
+            else => |e| return std.posix.unexpectedErrno(e),
+        };
+        if (cqe.res == 0) return error.FileChanged;
+        done += @intCast(cqe.res);
+    }
 }
 
 /// The access methods the workers may choose from. `--io=mmap` and `--io=pread` restrict
@@ -1520,7 +1604,7 @@ fn tunedSearcher(io: Io, pattern: []const u8, mapped: []const u8, io_mode: IoMod
         .mmap => s.tune(mapped[0..n]),
         .pread => {
             var buf: [tune_sample_bytes]u8 = undefined;
-            readAt(io, file.?, buf[0..n], 0) catch return s;
+            readAt(io, file.?, buf[0..n], 0, null) catch return s;
             s.tune(buf[0..n]);
         },
     }
@@ -3493,6 +3577,27 @@ test "AccessStats tries every allowed method, then keeps the fastest, with eithe
     }
 }
 
+/// The searches have returned their memory, apart from the buffers an idle pool thread
+/// keeps (`retain`). That thread trims after the last search returns (`Pool.work`), so
+/// the check waits for it. `testing.expect` prints nothing on failure: the x86-64 v1
+/// `test-levels` job on a GitHub runner (2026-10-12) reported this test failed with an
+/// empty stderr. The v2 and v3 builds in that job passed the same test.
+fn expectIdle(pool: *Pool) !void {
+    try testing.expectEqual(@as(usize, 0), pool.mem.queued.load(.monotonic));
+    pool.wake();
+    const start = Io.Timestamp.now(testing.io, .awake);
+    while (pool.mem.pool_bytes.load(.monotonic) > pool.retain) {
+        if (start.durationTo(Io.Timestamp.now(testing.io, .awake)).nanoseconds > std.time.ns_per_s) {
+            std.debug.print("shared engine kept {d} bytes of buffers, retain is {d}\n", .{
+                pool.mem.pool_bytes.load(.monotonic),
+                pool.retain,
+            });
+            return error.TestExpectedEqual;
+        }
+        std.atomic.spinLoopHint();
+    }
+}
+
 test "a shared engine runs concurrent searches, each with the reference output" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -3561,9 +3666,7 @@ test "a shared engine runs concurrent searches, each with the reference output" 
         }
         for (callers) |t| t.join();
         try testing.expect(!failed.load(.monotonic));
-        // Every search gave its memory back, but for the buffers the engine keeps.
-        try testing.expectEqual(@as(usize, 0), engine.pool.mem.queued.load(.monotonic));
-        try testing.expect(engine.pool.mem.pool_bytes.load(.monotonic) <= engine.pool.retain);
+        try expectIdle(engine.pool);
     }
 }
 
@@ -3651,8 +3754,7 @@ test "a search can be canceled or time out, before or while it runs" {
         try testing.expectError(error.Canceled, engine.search(.{ .file = file }, .{ .pattern = "a", .count_only = true, .cancel = &early }, &w1.w));
     }
     // The stopped searches gave their memory back, but for the buffers the engine keeps.
-    try testing.expectEqual(@as(usize, 0), shared.pool.mem.queued.load(.monotonic));
-    try testing.expect(shared.pool.mem.pool_bytes.load(.monotonic) <= shared.pool.retain);
+    try expectIdle(shared.pool);
 }
 
 test "a slow reader does not hold up the other searches of a shared engine" {
@@ -3760,8 +3862,7 @@ test "a file truncated during a search never brings the process down" {
             try testing.expectEqualStrings(want, sw.out.written());
         } else |err| try testing.expectEqual(error.FileChanged, err);
     };
-    try testing.expectEqual(@as(usize, 0), engine.pool.mem.queued.load(.monotonic));
-    try testing.expect(engine.pool.mem.pool_bytes.load(.monotonic) <= engine.pool.retain);
+    try expectIdle(engine.pool);
 
     // The engine goes on working.
     const want = try expectedOutput(gpa, data, .{ .pattern = "c a", .line_numbers = true });

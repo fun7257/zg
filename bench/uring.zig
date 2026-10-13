@@ -1,11 +1,14 @@
-//! Bandwidth experiment: zg's page-aligned `pread` against `io_uring` reads of the
-//! same shape, to see what it takes to fill the pipe.
+//! Bandwidth experiment for the shapes behind Linux `Access.read`.
 //!
-//! `pread` here means a positional read into a page-aligned buffer (zg's `readAt`
-//! rounds the start down to a page because a copy whose source and destination sit
-//! at different offsets in a cache line is several times slower on x86). io_uring
-//! issues the same read (`IORING_OP_READ`, or `IORING_OP_READ_FIXED` when the
-//! buffers fit in the locked-memory limit) with several in flight per thread.
+//! On Linux, zg's positional path (`--io=pread`) is already `io_uring` at depth one
+//! (`readAt` in `src/zg.zig`). This bench keeps a synchronous `pread` row as the
+//! baseline and varies queue depth, registered buffers, SQPOLL and `O_DIRECT`, to
+//! see what fills each pipe.
+//!
+//! Reads are into a page-aligned buffer (zg's `readAt` rounds the start down to a
+//! page because a copy whose source and destination sit at different offsets in a
+//! cache line is several times slower on x86). io_uring rows use `IORING_OP_READ`
+//! (or `IORING_OP_READ_FIXED` when the buffers fit in the locked-memory limit).
 //!
 //! Three ceilings, measured apart because they are different pipes:
 //! - warm: the file is in the page cache. The limit is the copy out of it.
